@@ -5,9 +5,8 @@
 #include "ledger/LedgerTypeUtils.h"
 #include "crypto/SHA.h"
 #include "util/GlobalChecks.h"
-#include "util/UnorderedMap.h"
-#include "util/UnorderedSet.h"
 #include "util/types.h"
+#include <fmt/format.h>
 
 namespace stellar
 {

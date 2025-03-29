@@ -3,9 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "transactions/TransactionUtils.h"
-#include "bucket/BucketListSnapshot.h"
 #include "crypto/SHA.h"
-#include "crypto/SecretKey.h"
 #include "ledger/InternalLedgerEntry.h"
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
@@ -15,7 +13,6 @@
 #include "transactions/OfferExchange.h"
 #include "transactions/SponsorshipUtils.h"
 #include "util/ProtocolVersion.h"
-#include "util/XDROperators.h"
 #include "util/types.h"
 #include "xdr/Stellar-contract.h"
 #include "xdr/Stellar-ledger-entries.h"
@@ -1983,12 +1980,10 @@ hasMuxedAccount(TransactionEnvelope const& e)
 }
 
 bool
-isTransactionXDRValidForCurrentProtocol(Application& app,
-                                        TransactionEnvelope const& envelope)
+isTransactionXDRValidForProtocol(uint32_t currProtocol, Config const& cfg,
+                                 TransactionEnvelope const& envelope)
 {
-    uint32_t maxProtocol = app.getConfig().CURRENT_LEDGER_PROTOCOL_VERSION;
-    uint32_t currProtocol =
-        app.getLedgerManager().getLastClosedLedgerHeader().header.ledgerVersion;
+    uint32_t maxProtocol = cfg.CURRENT_LEDGER_PROTOCOL_VERSION;
     // If we could parse the XDR when ledger is using the maximum supported
     // protocol version, then XDR has to be valid.
     // This check also is pointless before protocol 21 as Soroban environment

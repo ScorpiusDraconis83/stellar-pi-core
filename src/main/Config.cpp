@@ -4,21 +4,18 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "main/Config.h"
-#include "bucket/BucketList.h"
-#include "crypto/Hex.h"
+#include "bucket/BucketIndexUtils.h"
+#include "bucket/LiveBucketList.h"
 #include "crypto/KeyUtils.h"
 #include "herder/Herder.h"
 #include "history/HistoryArchive.h"
 #include "ledger/LedgerManager.h"
-#include "main/ExternalQueue.h"
 #include "main/StellarCoreVersion.h"
 #include "scp/LocalNode.h"
 #include "scp/QuorumSetUtils.h"
 #include "util/Fs.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
-#include "util/XDROperators.h"
-#include "util/types.h"
 
 #include "overlay/OverlayManager.h"
 #include "util/UnorderedSet.h"
@@ -33,7 +30,7 @@
 
 namespace stellar
 {
-const uint32 Config::CURRENT_LEDGER_PROTOCOL_VERSION = 21
+const uint32 Config::CURRENT_LEDGER_PROTOCOL_VERSION = 22
 #ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
                                                        + 1
 #endif
@@ -46,6 +43,9 @@ static const std::unordered_set<std::string> TESTING_ONLY_OPTIONS = {
     "RUN_STANDALONE",
     "MANUAL_CLOSE",
     "ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING",
+    "LOADGEN_PREGENERATED_TRANSACTIONS_FILE",
+    "GENESIS_TEST_ACCOUNT_COUNT",
+    "UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING",
     "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING",
     "ARTIFICIALLY_SET_CLOSE_TIME_FOR_TESTING",
     "ARTIFICIALLY_REPLAY_WITH_NEWEST_BUCKET_LOGIC_FOR_TESTING",
@@ -67,7 +67,8 @@ static const std::unordered_set<std::string> TESTING_ONLY_OPTIONS = {
     "ARTIFICIALLY_SET_SURVEY_PHASE_DURATION_FOR_TESTING",
     "ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING",
     "ARTIFICIALLY_SLEEP_MAIN_THREAD_FOR_TESTING",
-    "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING"};
+    "ARTIFICIALLY_SKIP_CONNECTION_ADJUSTMENT_FOR_TESTING",
+    "ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING"};
 
 // Options that should only be used for testing
 static const std::unordered_set<std::string> TESTING_SUGGESTED_OPTIONS = {
@@ -121,9 +122,7 @@ Config::Config() : NODE_SEED(SecretKey::random())
 
     // non configurable
     MODE_ENABLES_BUCKETLIST = true;
-    MODE_USES_IN_MEMORY_LEDGER = false;
     MODE_STORES_HISTORY_MISC = true;
-    MODE_STORES_HISTORY_LEDGERHEADERS = true;
     MODE_DOES_CATCHUP = true;
     MODE_AUTO_STARTS_OVERLAY = true;
     OP_APPLY_SLEEP_TIME_DURATION_FOR_TESTING =
@@ -151,8 +150,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
     LEDGER_PROTOCOL_VERSION = CURRENT_LEDGER_PROTOCOL_VERSION;
     LEDGER_PROTOCOL_MIN_VERSION_INTERNAL_ERROR_REPORT = 18;
 
-    OVERLAY_PROTOCOL_MIN_VERSION = 33;
-    OVERLAY_PROTOCOL_VERSION = 35;
+    OVERLAY_PROTOCOL_MIN_VERSION = 35;
+    OVERLAY_PROTOCOL_VERSION = 37;
 
     VERSION_STR = STELLAR_CORE_VERSION;
 
@@ -161,13 +160,12 @@ Config::Config() : NODE_SEED(SecretKey::random())
     MANUAL_CLOSE = false;
     CATCHUP_COMPLETE = false;
     CATCHUP_RECENT = 0;
-    EXPERIMENTAL_PRECAUTION_DELAY_META = false;
-    EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING = false;
-    DEPRECATED_SQL_LEDGER_STATE = false;
+    BACKGROUND_OVERLAY_PROCESSING = true;
+    EXPERIMENTAL_PARALLEL_LEDGER_APPLY = false;
     BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 14; // 2^14 == 16 kb
     BUCKETLIST_DB_INDEX_CUTOFF = 20;             // 20 mb
+    BUCKETLIST_DB_MEMORY_FOR_CACHING = 0;
     BUCKETLIST_DB_PERSIST_INDEX = true;
-    BACKGROUND_EVICTION_SCAN = true;
     PUBLISH_TO_ARCHIVE_DELAY = std::chrono::seconds{0};
     // automatic maintenance settings:
     // short and prime with 1 hour which will cause automatic maintenance to
@@ -182,6 +180,8 @@ Config::Config() : NODE_SEED(SecretKey::random())
     // automatic self-check happens once every 3 hours
     AUTOMATIC_SELF_CHECK_PERIOD = std::chrono::seconds{3 * 60 * 60};
     ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = false;
+    LOADGEN_PREGENERATED_TRANSACTIONS_FILE = "stellar-load-transactions.xdr";
+    UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING = false;
     ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = false;
     ARTIFICIALLY_SET_CLOSE_TIME_FOR_TESTING = 0;
     ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING = false;
@@ -190,8 +190,10 @@ Config::Config() : NODE_SEED(SecretKey::random())
     ARTIFICIALLY_REPLAY_WITH_NEWEST_BUCKET_LOGIC_FOR_TESTING = false;
     ARTIFICIALLY_DELAY_BUCKET_APPLICATION_FOR_TESTING =
         std::chrono::seconds::zero();
+    ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING = std::chrono::milliseconds(0);
     ALLOW_LOCALHOST_FOR_TESTING = false;
     USE_CONFIG_FOR_GENESIS = false;
+    GENESIS_TEST_ACCOUNT_COUNT = 0;
     FAILURE_SAFETY = -1;
     UNSAFE_QUORUM = false;
     DISABLE_BUCKET_GC = false;
@@ -306,8 +308,12 @@ Config::Config() : NODE_SEED(SecretKey::random())
     EMIT_SOROBAN_TRANSACTION_META_EXT_V1 = false;
     EMIT_LEDGER_CLOSE_META_EXT_V1 = false;
 
+    FORCE_OLD_STYLE_LEADER_ELECTION = false;
+
 #ifdef BUILD_TESTS
     TEST_CASES_ENABLED = false;
+    CATCHUP_SKIP_KNOWN_RESULTS_FOR_TESTING = false;
+    MODE_USES_IN_MEMORY_LEDGER = false;
 #endif
 
 #ifdef BEST_OFFER_DEBUGGING
@@ -572,7 +578,7 @@ Config::toString(ValidatorQuality q) const
     return kQualities[static_cast<int>(q)];
 }
 
-Config::ValidatorQuality
+ValidatorQuality
 Config::parseQuality(std::string const& q) const
 {
     auto it = std::find(kQualities.begin(), kQualities.end(), q);
@@ -581,7 +587,7 @@ Config::parseQuality(std::string const& q) const
 
     if (it != kQualities.end())
     {
-        res = static_cast<Config::ValidatorQuality>(
+        res = static_cast<ValidatorQuality>(
             std::distance(kQualities.begin(), it));
     }
     else
@@ -592,7 +598,7 @@ Config::parseQuality(std::string const& q) const
     return res;
 }
 
-std::vector<Config::ValidatorEntry>
+std::vector<ValidatorEntry>
 Config::parseValidators(
     std::shared_ptr<cpptoml::base> validators,
     UnorderedMap<std::string, ValidatorQuality> const& domainQualityMap)
@@ -715,7 +721,7 @@ Config::parseValidators(
     return res;
 }
 
-UnorderedMap<std::string, Config::ValidatorQuality>
+UnorderedMap<std::string, ValidatorQuality>
 Config::parseDomainsQuality(std::shared_ptr<cpptoml::base> domainsQuality)
 {
     UnorderedMap<std::string, ValidatorQuality> res;
@@ -1028,12 +1034,12 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 {"PEER_FLOOD_READING_CAPACITY_BYTES",
                  [&]() {
                      PEER_FLOOD_READING_CAPACITY_BYTES =
-                         readInt<uint32_t>(item, 1);
+                         readInt<uint32_t>(item, 0);
                  }},
                 {"FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES",
                  [&]() {
                      FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES =
-                         readInt<uint32_t>(item, 1);
+                         readInt<uint32_t>(item, 0);
                  }},
                 {"OUTBOUND_TX_QUEUE_BYTE_LIMIT",
                  [&]() {
@@ -1058,37 +1064,55 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  [&]() { DISABLE_XDR_FSYNC = readBool(item); }},
                 {"METADATA_OUTPUT_STREAM",
                  [&]() { METADATA_OUTPUT_STREAM = readString(item); }},
-                {"EXPERIMENTAL_PRECAUTION_DELAY_META",
-                 [&]() {
-                     EXPERIMENTAL_PRECAUTION_DELAY_META = readBool(item);
-                 }},
                 {"EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING",
                  [&]() {
-                     EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING =
-                         readBool(item);
+                     CLOG_WARNING(Overlay,
+                                  "EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING "
+                                  "is deprecated. Use "
+                                  "BACKGROUND_OVERLAY_PROCESSING instead");
+                     BACKGROUND_OVERLAY_PROCESSING = readBool(item);
                  }},
+                {"BACKGROUND_OVERLAY_PROCESSING",
+                 [&]() { BACKGROUND_OVERLAY_PROCESSING = readBool(item); }},
+                {"EXPERIMENTAL_PARALLEL_LEDGER_APPLY",
+                 [&]() {
+                     EXPERIMENTAL_PARALLEL_LEDGER_APPLY = readBool(item);
+                 }},
+                {"ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING",
+                 [&]() {
+                     ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =
+                         std::chrono::milliseconds(readInt<uint32_t>(item));
+                 }},
+                // https://github.com/stellar/stellar-core/issues/4581
                 {"BACKGROUND_EVICTION_SCAN",
-                 [&]() { BACKGROUND_EVICTION_SCAN = readBool(item); }},
-                // TODO: Flag is no longer supported, remove in next release.
+                 [&]() {
+                     CLOG_WARNING(
+                         Bucket,
+                         "BACKGROUND_EVICTION_SCAN is deprecated and ignored. "
+                         "Please remove this from config");
+                 }},
                 {"EXPERIMENTAL_BACKGROUND_EVICTION_SCAN",
                  [&]() {
                      CLOG_WARNING(
                          Bucket,
                          "EXPERIMENTAL_BACKGROUND_EVICTION_SCAN is deprecated "
                          "and "
-                         "is ignored. Use BACKGROUND_EVICTION_SCAN instead");
+                         "is ignored. Please remove from config");
                  }},
                 {"DEPRECATED_SQL_LEDGER_STATE",
-                 [&]() { DEPRECATED_SQL_LEDGER_STATE = readBool(item); }},
-                // Still support EXPERIMENTAL_BUCKETLIST_DB* flags for
-                // captive-core for 21.0 release, remove in 21.1 release
-                {"EXPERIMENTAL_BUCKETLIST_DB",
                  [&]() {
-                     DEPRECATED_SQL_LEDGER_STATE = !readBool(item);
                      CLOG_WARNING(
                          Bucket,
-                         "EXPERIMENTAL_BUCKETLIST_DB flag is deprecated, "
-                         "use DEPRECATED_SQL_LEDGER_STATE=false instead.");
+                         "DEPRECATED_SQL_LEDGER_STATE is deprecated and "
+                         "ignored. Please remove from config");
+                 }},
+                // https://github.com/stellar/stellar-core/issues/4581
+                {"EXPERIMENTAL_BUCKETLIST_DB",
+                 [&]() {
+                     CLOG_WARNING(
+                         Bucket,
+                         "EXPERIMENTAL_BUCKETLIST_DB flag is deprecated. "
+                         "please remove from config");
                  }},
                 {"EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
                  [&]() {
@@ -1122,24 +1146,16 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                      BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT =
                          readInt<size_t>(item);
                  }},
+                {"BUCKETLIST_DB_MEMORY_FOR_CACHING",
+                 [&]() {
+                     BUCKETLIST_DB_MEMORY_FOR_CACHING = readInt<size_t>(item);
+                 }},
                 {"BUCKETLIST_DB_INDEX_CUTOFF",
                  [&]() { BUCKETLIST_DB_INDEX_CUTOFF = readInt<size_t>(item); }},
                 {"BUCKETLIST_DB_PERSIST_INDEX",
                  [&]() { BUCKETLIST_DB_PERSIST_INDEX = readBool(item); }},
                 {"METADATA_DEBUG_LEDGERS",
                  [&]() { METADATA_DEBUG_LEDGERS = readInt<uint32_t>(item); }},
-                {"KNOWN_CURSORS",
-                 [&]() {
-                     KNOWN_CURSORS = readArray<std::string>(item);
-                     for (auto const& c : KNOWN_CURSORS)
-                     {
-                         if (!ExternalQueue::validateResourceID(c))
-                         {
-                             throw std::invalid_argument(fmt::format(
-                                 FMT_STRING("invalid cursor: \"{}\""), c));
-                         }
-                     }
-                 }},
                 {"RUN_STANDALONE", [&]() { RUN_STANDALONE = readBool(item); }},
                 {"CATCHUP_COMPLETE",
                  [&]() { CATCHUP_COMPLETE = readBool(item); }},
@@ -1148,9 +1164,24 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                      CATCHUP_RECENT =
                          readInt<uint32_t>(item, 0, UINT32_MAX - 1);
                  }},
+#ifdef BUILD_TESTS
+                {"CATCHUP_SKIP_KNOWN_RESULTS_FOR_TESTING",
+                 [&]() {
+                     CATCHUP_SKIP_KNOWN_RESULTS_FOR_TESTING = readBool(item);
+                 }},
+#endif // BUILD_TESTS
                 {"ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING",
                  [&]() {
                      ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = readBool(item);
+                 }},
+                {"LOADGEN_PREGENERATED_TRANSACTIONS_FILE",
+                 [&]() {
+                     LOADGEN_PREGENERATED_TRANSACTIONS_FILE = readString(item);
+                 }},
+                {"UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING",
+                 [&]() {
+                     UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING =
+                         readBool(item);
                  }},
                 {"ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING",
                  [&]() {
@@ -1445,57 +1476,176 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 {"LOADGEN_OP_COUNT_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_OP_COUNT_DISTRIBUTION_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_WASM_BYTES_FOR_TESTING",
                  [&]() {
                      LOADGEN_WASM_BYTES_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_WASM_BYTES_DISTRIBUTION_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_NUM_DATA_ENTRIES_FOR_TESTING",
                  [&]() {
                      LOADGEN_NUM_DATA_ENTRIES_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_NUM_DATA_ENTRIES_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_NUM_DATA_ENTRIES_DISTRIBUTION_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_IO_KILOBYTES_FOR_TESTING",
                  [&]() {
                      LOADGEN_IO_KILOBYTES_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_IO_KILOBYTES_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_IO_KILOBYTES_DISTRIBUTION_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_TX_SIZE_BYTES_FOR_TESTING",
                  [&]() {
                      LOADGEN_TX_SIZE_BYTES_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING =
-                         readIntArray<uint32>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_INSTRUCTIONS_FOR_TESTING",
                  [&]() {
                      LOADGEN_INSTRUCTIONS_FOR_TESTING =
-                         readIntArray<uint64>(item);
+                         readIntArray<uint32_t>(item);
                  }},
                 {"LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING",
                  [&]() {
                      LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING =
+                         readIntArray<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_DATA_ENTRY_SIZE_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_DATA_ENTRY_SIZE_FOR_TESTING =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_BL_SIMULATED_LEDGERS",
+                 [&]() {
+                     APPLY_LOAD_BL_SIMULATED_LEDGERS = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_BL_WRITE_FREQUENCY",
+                 [&]() {
+                     APPLY_LOAD_BL_WRITE_FREQUENCY = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_BL_BATCH_SIZE",
+                 [&]() { APPLY_LOAD_BL_BATCH_SIZE = readInt<uint32_t>(item); }},
+                {"APPLY_LOAD_BL_LAST_BATCH_LEDGERS",
+                 [&]() {
+                     APPLY_LOAD_BL_LAST_BATCH_LEDGERS = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_BL_LAST_BATCH_SIZE",
+                 [&]() {
+                     APPLY_LOAD_BL_LAST_BATCH_SIZE = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_NUM_RO_ENTRIES_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_NUM_RO_ENTRIES_FOR_TESTING =
                          readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_NUM_RO_ENTRIES_DISTRIBUTION_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_NUM_RO_ENTRIES_DISTRIBUTION_FOR_TESTING =
+                         readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_NUM_RW_ENTRIES_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_NUM_RW_ENTRIES_FOR_TESTING =
+                         readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_NUM_RW_ENTRIES_DISTRIBUTION_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_NUM_RW_ENTRIES_DISTRIBUTION_FOR_TESTING =
+                         readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_EVENT_COUNT_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_EVENT_COUNT_FOR_TESTING =
+                         readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_EVENT_COUNT_DISTRIBUTION_FOR_TESTING",
+                 [&]() {
+                     APPLY_LOAD_EVENT_COUNT_DISTRIBUTION_FOR_TESTING =
+                         readIntArray<uint32>(item);
+                 }},
+                {"APPLY_LOAD_LEDGER_MAX_INSTRUCTIONS",
+                 [&]() {
+                     APPLY_LOAD_LEDGER_MAX_INSTRUCTIONS =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_TX_MAX_INSTRUCTIONS",
+                 [&]() {
+                     APPLY_LOAD_TX_MAX_INSTRUCTIONS = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_LEDGER_MAX_READ_LEDGER_ENTRIES",
+                 [&]() {
+                     APPLY_LOAD_LEDGER_MAX_READ_LEDGER_ENTRIES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_TX_MAX_READ_LEDGER_ENTRIES",
+                 [&]() {
+                     APPLY_LOAD_TX_MAX_READ_LEDGER_ENTRIES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_LEDGER_MAX_WRITE_LEDGER_ENTRIES",
+                 [&]() {
+                     APPLY_LOAD_LEDGER_MAX_WRITE_LEDGER_ENTRIES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_TX_MAX_WRITE_LEDGER_ENTRIES",
+                 [&]() {
+                     APPLY_LOAD_TX_MAX_WRITE_LEDGER_ENTRIES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_LEDGER_MAX_READ_BYTES",
+                 [&]() {
+                     APPLY_LOAD_LEDGER_MAX_READ_BYTES = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_TX_MAX_READ_BYTES",
+                 [&]() {
+                     APPLY_LOAD_TX_MAX_READ_BYTES = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_LEDGER_MAX_WRITE_BYTES",
+                 [&]() {
+                     APPLY_LOAD_LEDGER_MAX_WRITE_BYTES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_TX_MAX_WRITE_BYTES",
+                 [&]() {
+                     APPLY_LOAD_TX_MAX_WRITE_BYTES = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_MAX_TX_SIZE_BYTES",
+                 [&]() {
+                     APPLY_LOAD_MAX_TX_SIZE_BYTES = readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_MAX_LEDGER_TX_SIZE_BYTES",
+                 [&]() {
+                     APPLY_LOAD_MAX_LEDGER_TX_SIZE_BYTES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_MAX_CONTRACT_EVENT_SIZE_BYTES",
+                 [&]() {
+                     APPLY_LOAD_MAX_CONTRACT_EVENT_SIZE_BYTES =
+                         readInt<uint32_t>(item);
+                 }},
+                {"APPLY_LOAD_MAX_TX_COUNT",
+                 [&]() { APPLY_LOAD_MAX_TX_COUNT = readInt<uint32_t>(item); }},
+                {"GENESIS_TEST_ACCOUNT_COUNT",
+                 [&]() {
+                     GENESIS_TEST_ACCOUNT_COUNT = readInt<uint32_t>(item, 0);
                  }},
                 {"CATCHUP_WAIT_MERGES_TX_APPLY_FOR_TESTING",
                  [&]() {
@@ -1566,8 +1716,8 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                  }},
                 {"TESTING_STARTING_EVICTION_SCAN_LEVEL",
                  [&]() {
-                     TESTING_STARTING_EVICTION_SCAN_LEVEL =
-                         readInt<uint32_t>(item, 1, BucketList::kNumLevels - 1);
+                     TESTING_STARTING_EVICTION_SCAN_LEVEL = readInt<uint32_t>(
+                         item, 1, LiveBucketList::kNumLevels - 1);
                  }},
                 {"TESTING_MAX_ENTRIES_TO_ARCHIVE",
                  [&]() {
@@ -1616,6 +1766,10 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 it->second();
             }
+            else if (item.first == "FORCE_OLD_STYLE_LEADER_ELECTION")
+            {
+                FORCE_OLD_STYLE_LEADER_ELECTION = readBool(item);
+            }
             else
             {
                 std::string err("Unknown configuration entry: '");
@@ -1646,6 +1800,15 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 "Invalid configuration: "
                 "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES "
                 "can't be greater than PEER_FLOOD_READING_CAPACITY_BYTES";
+            throw std::runtime_error(msg);
+        }
+
+        if (EXPERIMENTAL_PARALLEL_LEDGER_APPLY && !parallelLedgerClose())
+        {
+            std::string msg =
+                "Invalid configuration: EXPERIMENTAL_PARALLEL_LEDGER_APPLY "
+                "does not support SQLite. Either switch to Postgres or set "
+                "EXPERIMENTAL_PARALLEL_LEDGER_APPLY=false";
             throw std::runtime_error(msg);
         }
 
@@ -1683,33 +1846,11 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
         // Validators default to starting the network from local state
         FORCE_SCP = NODE_IS_VALIDATOR;
 
-        // Require either DEPRECATED_SQL_LEDGER_STATE or
-        // EXPERIMENTAL_BUCKETLIST_DB to be backwards compatible with horizon
-        // and RPC, but do not allow both.
-        if (!t->contains("DEPRECATED_SQL_LEDGER_STATE") &&
-            !t->contains("EXPERIMENTAL_BUCKETLIST_DB"))
-        {
-            std::string msg =
-                "Invalid configuration: "
-                "DEPRECATED_SQL_LEDGER_STATE not set. Default setting is FALSE "
-                "and is appropriate for most nodes.";
-            throw std::runtime_error(msg);
-        }
         // Only allow one version of all BucketListDB flags, either the
         // deprecated flag or new flag, but not both.
-        else if (t->contains("DEPRECATED_SQL_LEDGER_STATE") &&
-                 t->contains("EXPERIMENTAL_BUCKETLIST_DB"))
-        {
-            std::string msg =
-                "Invalid configuration: EXPERIMENTAL_BUCKETLIST_DB and "
-                "DEPRECATED_SQL_LEDGER_STATE must not both be set. "
-                "EXPERIMENTAL_BUCKETLIST_DB is deprecated, use "
-                "DEPRECATED_SQL_LEDGER_STATE only.";
-            throw std::runtime_error(msg);
-        }
-        else if (t->contains(
-                     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT") &&
-                 t->contains("BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT"))
+        if (t->contains(
+                "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT") &&
+            t->contains("BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT"))
         {
             std::string msg =
                 "Invalid configuration: "
@@ -1740,14 +1881,6 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
                 "EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF is deprecated, use "
                 "BUCKETLIST_DB_INDEX_CUTOFF only.";
             throw std::runtime_error(msg);
-        }
-
-        // If DEPRECATED_SQL_LEDGER_STATE is set to false and
-        // BACKGROUND_EVICTION_SCAN is not set, override default value to false
-        // so that nodes still running SQL ledger don't crash on startup
-        if (!isUsingBucketListDB() && !t->contains("BACKGROUND_EVICTION_SCAN"))
-        {
-            BACKGROUND_EVICTION_SCAN = false;
         }
 
         // process elements that potentially depend on others
@@ -1806,6 +1939,7 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             LOG_INFO(DEFAULT_LOG, "Generated QUORUM_SET: {}", autoQSetStr);
             QUORUM_SET = autoQSet;
             verifyHistoryValidatorsBlocking(validators);
+            setValidatorWeightConfig(validators);
             // count the number of domains
             UnorderedSet<std::string> domains;
             for (auto const& v : validators)
@@ -1963,7 +2097,7 @@ Config::adjust()
 }
 
 void
-Config::logBasicInfo()
+Config::logBasicInfo() const
 {
     LOG_INFO(DEFAULT_LOG, "Connection effective settings:");
     LOG_INFO(DEFAULT_LOG, "TARGET_PEER_CONNECTIONS: {}",
@@ -1977,9 +2111,13 @@ Config::logBasicInfo()
     LOG_INFO(DEFAULT_LOG, "MAX_INBOUND_PENDING_CONNECTIONS: {}",
              MAX_INBOUND_PENDING_CONNECTIONS);
     LOG_INFO(DEFAULT_LOG,
-             "EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING="
+             "BACKGROUND_OVERLAY_PROCESSING="
              "{}",
-             EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING ? "true" : "false");
+             BACKGROUND_OVERLAY_PROCESSING ? "true" : "false");
+    LOG_INFO(DEFAULT_LOG,
+             "EXPERIMENTAL_PARALLEL_LEDGER_APPLY="
+             "{}",
+             EXPERIMENTAL_PARALLEL_LEDGER_APPLY ? "true" : "false");
 }
 
 void
@@ -2256,17 +2394,6 @@ Config::getExpectedLedgerCloseTime() const
     return Herder::EXP_LEDGER_TIMESPAN_SECONDS;
 }
 
-void
-Config::setInMemoryMode()
-{
-    MODE_USES_IN_MEMORY_LEDGER = true;
-    DATABASE = SecretValue{"sqlite3://:memory:"};
-    MODE_STORES_HISTORY_MISC = false;
-    MODE_STORES_HISTORY_LEDGERHEADERS = false;
-    MODE_ENABLES_BUCKETLIST = true;
-    BACKGROUND_EVICTION_SCAN = false;
-}
-
 bool
 Config::modeDoesCatchupWithBucketList() const
 {
@@ -2274,46 +2401,10 @@ Config::modeDoesCatchupWithBucketList() const
 }
 
 bool
-Config::isInMemoryMode() const
+Config::parallelLedgerClose() const
 {
-    return MODE_USES_IN_MEMORY_LEDGER;
-}
-
-bool
-Config::isUsingBucketListDB() const
-{
-    return !DEPRECATED_SQL_LEDGER_STATE && !MODE_USES_IN_MEMORY_LEDGER &&
-           MODE_ENABLES_BUCKETLIST;
-}
-
-bool
-Config::isUsingBackgroundEviction() const
-{
-    return isUsingBucketListDB() && BACKGROUND_EVICTION_SCAN;
-}
-
-bool
-Config::isPersistingBucketListDBIndexes() const
-{
-    return isUsingBucketListDB() && BUCKETLIST_DB_PERSIST_INDEX;
-}
-
-bool
-Config::isInMemoryModeWithoutMinimalDB() const
-{
-    return MODE_USES_IN_MEMORY_LEDGER && !MODE_STORES_HISTORY_LEDGERHEADERS;
-}
-
-bool
-Config::modeStoresAllHistory() const
-{
-    return MODE_STORES_HISTORY_LEDGERHEADERS && MODE_STORES_HISTORY_MISC;
-}
-
-bool
-Config::modeStoresAnyHistory() const
-{
-    return MODE_STORES_HISTORY_LEDGERHEADERS || MODE_STORES_HISTORY_MISC;
+    return EXPERIMENTAL_PARALLEL_LEDGER_APPLY &&
+           !(DATABASE.value.find("sqlite3://") != std::string::npos);
 }
 
 void
@@ -2427,6 +2518,83 @@ Config::toString(SCPQuorumSet const& qset)
     Json::StyledWriter fw;
     return fw.write(json);
 }
+
+void
+Config::setValidatorWeightConfig(std::vector<ValidatorEntry> const& validators)
+{
+    releaseAssert(!VALIDATOR_WEIGHT_CONFIG.has_value());
+
+    if (!NODE_IS_VALIDATOR)
+    {
+        // There is no reason to populate VALIDATOR_WEIGHT_CONFIG if the node is
+        // not a validator.
+        return;
+    }
+
+    ValidatorWeightConfig& vwc = VALIDATOR_WEIGHT_CONFIG.emplace();
+    ValidatorQuality highestQuality = ValidatorQuality::VALIDATOR_LOW_QUALITY;
+    ValidatorQuality lowestQuality =
+        ValidatorQuality::VALIDATOR_CRITICAL_QUALITY;
+    UnorderedMap<ValidatorQuality, UnorderedSet<std::string>>
+        homeDomainsByQuality;
+    for (auto const& v : validators)
+    {
+        if (!vwc.mValidatorEntries.try_emplace(v.mKey, v).second)
+        {
+            throw std::invalid_argument(
+                fmt::format(FMT_STRING("Duplicate validator entry for '{}'"),
+                            KeyUtils::toStrKey(v.mKey)));
+        }
+        ++vwc.mHomeDomainSizes[v.mHomeDomain];
+        highestQuality = std::max(highestQuality, v.mQuality);
+        lowestQuality = std::min(lowestQuality, v.mQuality);
+        homeDomainsByQuality[v.mQuality].insert(v.mHomeDomain);
+    }
+
+    if (NODE_IS_VALIDATOR &&
+        highestQuality == ValidatorQuality::VALIDATOR_LOW_QUALITY)
+    {
+        throw std::invalid_argument(
+            "At least one validator must have a quality "
+            "level higher than LOW");
+    }
+
+    // Highest quality level has weight UINT64_MAX
+    vwc.mQualityWeights[highestQuality] = UINT64_MAX;
+
+    // Assign weights to the remaining quality levels
+    for (int q = static_cast<int>(highestQuality) - 1;
+         q >= static_cast<int>(lowestQuality); --q)
+    {
+        // Next higher quality level
+        ValidatorQuality higherQuality = static_cast<ValidatorQuality>(q + 1);
+
+        // Get weight of next higher quality level
+        uint64 higherWeight = vwc.mQualityWeights.at(higherQuality);
+
+        // Get number of orgs at next higher quality level. Add 1 for the
+        // virtual org containing this quality level.
+        uint64 higherOrgs = homeDomainsByQuality[higherQuality].size() + 1;
+
+        // The weight of this quality level is the higher quality weight divided
+        // by the number of orgs at that quality level multiplied by 10
+        vwc.mQualityWeights[static_cast<ValidatorQuality>(q)] =
+            higherWeight / (higherOrgs * 10);
+    }
+
+    // Special case: LOW quality level has weight 0
+    vwc.mQualityWeights[ValidatorQuality::VALIDATOR_LOW_QUALITY] = 0;
+}
+
+#ifdef BUILD_TESTS
+void
+Config::generateQuorumSetForTesting(
+    std::vector<ValidatorEntry> const& validators)
+{
+    QUORUM_SET = generateQuorumSet(validators);
+    setValidatorWeightConfig(validators);
+}
+#endif // BUILD_TESTS
 
 std::string const Config::STDIN_SPECIAL_NAME = "stdin";
 }

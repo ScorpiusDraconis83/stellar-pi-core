@@ -5,16 +5,24 @@
 // This file contains tests for the BucketIndex and higher-level operations
 // concerning key-value lookup based on the BucketList.
 
-#include "bucket/BucketList.h"
-#include "bucket/BucketListSnapshot.h"
+#include "bucket/BucketInputIterator.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketSnapshotManager.h"
+#include "bucket/BucketUtils.h"
+#include "bucket/LiveBucket.h"
+#include "bucket/LiveBucketList.h"
 #include "bucket/test/BucketTestUtils.h"
+#include "ledger/LedgerTypeUtils.h"
 #include "ledger/test/LedgerTestUtils.h"
 #include "lib/catch.hpp"
 #include "main/Application.h"
 #include "main/Config.h"
 #include "test/test.h"
+
+#include "util/UnorderedMap.h"
+#include "util/UnorderedSet.h"
+#include "util/XDRCereal.h"
+#include "util/types.h"
 
 using namespace stellar;
 using namespace BucketTestUtils;
@@ -30,6 +38,7 @@ class BucketIndexTest
 
     // Mapping of Key->value that BucketList should return
     UnorderedMap<LedgerKey, LedgerEntry> mTestEntries;
+    UnorderedSet<LedgerKey> mGeneratedKeys;
 
     // Set of keys to query BucketList for
     LedgerKeySet mKeysToSearch;
@@ -58,18 +67,23 @@ class BucketIndexTest
     }
 
     void
-    buildBucketList(std::function<void(std::vector<LedgerEntry>&)> f)
+    buildBucketList(std::function<void(std::vector<LedgerEntry>&)> f,
+                    bool isCacheTest = false)
     {
         uint32_t ledger = 0;
         do
         {
             ++ledger;
             std::vector<LedgerEntry> entries =
-                LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
-                    {CONFIG_SETTING}, 10);
+                isCacheTest
+                    ? LedgerTestUtils::
+                          generateValidUniqueLedgerEntriesWithTypes(
+                              {ACCOUNT}, 10, mGeneratedKeys)
+                    : LedgerTestUtils::generateValidLedgerEntriesWithExclusions(
+                          {CONFIG_SETTING}, 10);
             f(entries);
             closeLedger(*mApp);
-        } while (!BucketList::levelShouldSpill(ledger, mLevelsToBuild - 1));
+        } while (!LiveBucketList::levelShouldSpill(ledger, mLevelsToBuild - 1));
     }
 
   public:
@@ -87,11 +101,13 @@ class BucketIndexTest
     }
 
     virtual void
-    buildGeneralTest()
+    buildGeneralTest(bool isCacheTest = false)
     {
         auto f = [&](std::vector<LedgerEntry> const& entries) {
-            // Sample ~4% of entries
-            if (mDist(gRandomEngine) < 10)
+            // Sample ~4% of entries if not a cache test
+            // For cache tests we want to load all entries to test eviction
+            // behavior
+            if (isCacheTest || mDist(gRandomEngine) < 10)
             {
                 for (auto const& e : entries)
                 {
@@ -104,7 +120,7 @@ class BucketIndexTest
                 {}, entries, {});
         };
 
-        buildBucketList(f);
+        buildBucketList(f, isCacheTest);
     }
 
     void
@@ -129,7 +145,7 @@ class BucketIndexTest
 
         auto searchableBL = getBM()
                                 .getBucketSnapshotManager()
-                                .copySearchableBucketListSnapshot();
+                                .copySearchableLiveBucketListSnapshot();
         auto lk = LedgerEntryKey(canonicalEntry);
 
         auto currentLoadedEntry = searchableBL->load(lk);
@@ -143,20 +159,18 @@ class BucketIndexTest
 
         for (uint32_t currLedger = ledger; currLedger > 0; --currLedger)
         {
-            auto [loadRes, snapshotExists] =
-                searchableBL->loadKeysFromLedger({lk}, currLedger);
+            auto loadRes = searchableBL->loadKeysFromLedger({lk}, currLedger);
 
             // If we query an older snapshot, should return <null, notFound>
             if (currLedger < ledger - mApp->getConfig().QUERY_SNAPSHOT_LEDGERS)
             {
-                REQUIRE(!snapshotExists);
-                REQUIRE(loadRes.empty());
+                REQUIRE(!loadRes);
             }
             else
             {
-                REQUIRE(snapshotExists);
-                REQUIRE(loadRes.size() == 1);
-                REQUIRE(loadRes[0].lastModifiedLedgerSeq == currLedger - 1);
+                REQUIRE(loadRes);
+                REQUIRE(loadRes->size() == 1);
+                REQUIRE(loadRes->at(0).lastModifiedLedgerSeq == currLedger - 1);
             }
         }
     }
@@ -246,22 +260,90 @@ class BucketIndexTest
     }
 
     virtual void
-    run()
+    run(std::optional<double> expectedHitRate = std::nullopt)
     {
         auto searchableBL = getBM()
                                 .getBucketSnapshotManager()
-                                .copySearchableBucketListSnapshot();
+                                .copySearchableLiveBucketListSnapshot();
+
+        auto& hitMeter = getBM().getCacheHitMeter();
+        auto& missMeter = getBM().getCacheMissMeter();
+        auto startingHitCount = hitMeter.count();
+        auto startingMissCount = missMeter.count();
+
+        // Checks hit rate then sets startingHitCount and startingMissCount
+        // to current values
+        auto checkHitRate = [&](auto expectedHitRate, auto& startingHitCount,
+                                auto& startingMissCount, auto numLoads) {
+            if (!expectedHitRate)
+            {
+                return;
+            }
+
+            if (*expectedHitRate == 1.0)
+            {
+                // We should have no misses
+                REQUIRE(missMeter.count() == startingMissCount);
+
+                // All point loads should be hits
+                REQUIRE(hitMeter.count() == startingHitCount + numLoads);
+            }
+            else
+            {
+                auto newMisses = missMeter.count() - startingMissCount;
+                auto newHits = hitMeter.count() - startingHitCount;
+                REQUIRE(newMisses > 0);
+                REQUIRE(newHits > 0);
+                REQUIRE(newMisses + newHits == numLoads);
+
+                auto hitRate =
+                    static_cast<double>(newHits) / (newMisses + newHits);
+
+                // Allow 15% deviation from expected hit rate
+                REQUIRE(hitRate < *expectedHitRate * 1.15);
+                REQUIRE(hitRate > *expectedHitRate * 0.85);
+            }
+
+            startingHitCount = hitMeter.count();
+            startingMissCount = missMeter.count();
+        };
 
         // Test bulk load lookup
         auto loadResult =
-            searchableBL->loadKeysWithLimits(mKeysToSearch, nullptr);
+            searchableBL->loadKeysWithLimits(mKeysToSearch, "test", nullptr);
         validateResults(mTestEntries, loadResult);
 
-        // Test individual entry lookup
-        loadResult.clear();
-        for (auto const& key : mKeysToSearch)
+        if (expectedHitRate)
         {
-            auto entryPtr = searchableBL->load(key);
+            // We should have no cache hits since we're starting from an empty
+            // cache
+            REQUIRE(hitMeter.count() == startingHitCount);
+            REQUIRE(missMeter.count() ==
+                    startingMissCount + mKeysToSearch.size());
+
+            startingHitCount = hitMeter.count();
+            startingMissCount = missMeter.count();
+        }
+
+        loadResult.clear();
+
+        // Test individual entry lookup
+        // Subtle: We use a "randomized LIFO" cache eviction policy, where we
+        // select two random elements and evict the older one. Our first load
+        // loads mKeysToSearch in order. If we were to do that again, we would
+        // hit the worst case cache performance, since we'd always be loading
+        // the oldest entry in the cache. We really just want to test that the
+        // cache size is respected, so we load keys in reverse order here. That
+        // way, our three loads are:
+        // 1. mKeysToSearch in-order (cache warming pass above)
+        // 2. mKeysToSearch in reverse order
+        // 3. mKeysToSearch in-order
+        // This avoids the worst case cache performance so metrics are more what
+        // we would expect for tests
+        for (auto iter = mKeysToSearch.rbegin(); iter != mKeysToSearch.rend();
+             ++iter)
+        {
+            auto entryPtr = searchableBL->load(*iter);
             if (entryPtr)
             {
                 loadResult.emplace_back(*entryPtr);
@@ -269,6 +351,20 @@ class BucketIndexTest
         }
 
         validateResults(mTestEntries, loadResult);
+
+        if (expectedHitRate)
+        {
+            checkHitRate(expectedHitRate, startingHitCount, startingMissCount,
+                         mKeysToSearch.size());
+
+            // Run bulk lookup again
+            auto loadResult2 = searchableBL->loadKeysWithLimits(
+                mKeysToSearch, "test", nullptr);
+            validateResults(mTestEntries, loadResult2);
+
+            checkHitRate(expectedHitRate, startingHitCount, startingMissCount,
+                         mKeysToSearch.size());
+        }
     }
 
     // Do many lookups with subsets of sampled entries
@@ -277,14 +373,14 @@ class BucketIndexTest
     {
         auto searchableBL = getBM()
                                 .getBucketSnapshotManager()
-                                .copySearchableBucketListSnapshot();
+                                .copySearchableLiveBucketListSnapshot();
         for (size_t i = 0; i < n; ++i)
         {
             LedgerKeySet searchSubset;
             UnorderedMap<LedgerKey, LedgerEntry> testEntriesSubset;
 
-            // Not actual size, as there may be duplicated elements, but good
-            // enough
+            // Not actual size, as there may be duplicated elements, but
+            // good enough
             auto subsetSize = 500;
             for (auto j = 0; j < subsetSize; ++j)
             {
@@ -307,7 +403,7 @@ class BucketIndexTest
             }
 
             auto blLoad =
-                searchableBL->loadKeysWithLimits(searchSubset, nullptr);
+                searchableBL->loadKeysWithLimits(searchSubset, "test", nullptr);
             validateResults(testEntriesSubset, blLoad);
         }
     }
@@ -317,7 +413,7 @@ class BucketIndexTest
     {
         auto searchableBL = getBM()
                                 .getBucketSnapshotManager()
-                                .copySearchableBucketListSnapshot();
+                                .copySearchableLiveBucketListSnapshot();
 
         // Load should return empty vector for keys not in bucket list
         auto keysNotInBL =
@@ -326,8 +422,8 @@ class BucketIndexTest
         LedgerKeySet invalidKeys(keysNotInBL.begin(), keysNotInBL.end());
 
         // Test bulk load
-        REQUIRE(searchableBL->loadKeysWithLimits(invalidKeys, nullptr).size() ==
-                0);
+        REQUIRE(searchableBL->loadKeysWithLimits(invalidKeys, "test", nullptr)
+                    .size() == 0);
 
         // Test individual load
         for (auto const& key : invalidKeys)
@@ -478,7 +574,7 @@ class BucketIndexPoolShareTest : public BucketIndexTest
     }
 
     virtual void
-    buildGeneralTest() override
+    buildGeneralTest(bool isCacheTest = false) override
     {
         buildTest(false);
     }
@@ -490,11 +586,11 @@ class BucketIndexPoolShareTest : public BucketIndexTest
     }
 
     virtual void
-    run() override
+    run(std::optional<double> expectedHitRate = std::nullopt) override
     {
         auto searchableBL = getBM()
                                 .getBucketSnapshotManager()
-                                .copySearchableBucketListSnapshot();
+                                .copySearchableLiveBucketListSnapshot();
         auto loadResult =
             searchableBL->loadPoolShareTrustLinesByAccountAndAsset(
                 mAccountToSearch.accountID, mAssetToSearch);
@@ -508,7 +604,6 @@ testAllIndexTypes(std::function<void(Config&)> f)
     SECTION("individual index only")
     {
         Config cfg(getTestConfig());
-        cfg.DEPRECATED_SQL_LEDGER_STATE = false;
         cfg.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 0;
         f(cfg);
     }
@@ -516,7 +611,6 @@ testAllIndexTypes(std::function<void(Config&)> f)
     SECTION("individual and range index")
     {
         Config cfg(getTestConfig());
-        cfg.DEPRECATED_SQL_LEDGER_STATE = false;
 
         // First 3 levels individual, last 3 range index
         cfg.BUCKETLIST_DB_INDEX_CUTOFF = 1;
@@ -526,7 +620,6 @@ testAllIndexTypes(std::function<void(Config&)> f)
     SECTION("range index only")
     {
         Config cfg(getTestConfig());
-        cfg.DEPRECATED_SQL_LEDGER_STATE = false;
         cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
         f(cfg);
     }
@@ -544,12 +637,229 @@ TEST_CASE("key-value lookup", "[bucket][bucketindex]")
     testAllIndexTypes(f);
 }
 
+TEST_CASE("bl cache", "[bucket][bucketindex]")
+{
+    SECTION("disable cache")
+    {
+        Config cfg(getTestConfig());
+        cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
+        cfg.BUCKETLIST_DB_MEMORY_FOR_CACHING = 0;
+
+        auto test = BucketIndexTest(cfg);
+        test.buildGeneralTest(/*isCacheTest=*/true);
+        test.run();
+
+        auto& liveBL = test.getBM().getLiveBucketList();
+        for (auto i = 0; i < LiveBucketList::kNumLevels; ++i)
+        {
+            auto level = liveBL.getLevel(i);
+            REQUIRE(level.getCurr()->getMaxCacheSize() == 0);
+            REQUIRE(level.getSnap()->getMaxCacheSize() == 0);
+        }
+
+        // We shouldn't meter anything when cache is disabled
+        auto& hitMeter = test.getBM().getCacheHitMeter();
+        auto& missMeter = test.getBM().getCacheMissMeter();
+        REQUIRE(hitMeter.count() == 0);
+        REQUIRE(missMeter.count() == 0);
+    }
+
+    auto runCacheTest = [](size_t cacheSizeMb, auto checkCacheSize,
+                           double expectedHitRate) {
+        // Use disk index for all levels so each bucket has a cache
+        Config cfg(getTestConfig());
+        cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
+        cfg.BUCKETLIST_DB_MEMORY_FOR_CACHING = cacheSizeMb;
+
+        auto test = BucketIndexTest(cfg);
+        test.buildGeneralTest(/*isCacheTest=*/true);
+        test.run(expectedHitRate);
+        auto& liveBL = test.getBM().getLiveBucketList();
+
+        for (auto i = 0; i < LiveBucketList::kNumLevels; ++i)
+        {
+            auto level = liveBL.getLevel(i);
+
+            checkCacheSize(level.getCurr());
+            checkCacheSize(level.getSnap());
+        }
+
+        return liveBL.sumBucketEntryCounters().entryTypeSizes.at(
+            LedgerEntryTypeAndDurability::ACCOUNT);
+    };
+
+    auto checkCompleteCacheSize = [](auto b) {
+        if (!b->isEmpty())
+        {
+            auto cacheSize = b->getMaxCacheSize();
+            auto accountsInBucket =
+                b->getBucketEntryCounters().entryTypeCounts.at(
+                    LedgerEntryTypeAndDurability::ACCOUNT);
+            REQUIRE(cacheSize == accountsInBucket);
+        }
+    };
+
+    // First run the test with a very large cache limit so we cache everything
+    auto approximateCacheSizeBytes =
+        runCacheTest(5'000, checkCompleteCacheSize, 1.0);
+
+    // Run the test again, but with a partial cache
+    auto cachedAccountEntries = 0;
+    auto totalAccountCount = 0;
+    auto checkPartialCacheSize = [&cachedAccountEntries,
+                                  &totalAccountCount](auto b) {
+        if (!b->isEmpty())
+        {
+            cachedAccountEntries += b->getMaxCacheSize();
+            totalAccountCount += b->getBucketEntryCounters().entryTypeCounts.at(
+                LedgerEntryTypeAndDurability::ACCOUNT);
+        }
+    };
+
+    // Cache approximately half of all entries
+    auto fullCacheSizeMB = approximateCacheSizeBytes / 1024 / 1024;
+    auto smallCacheSizeMB = fullCacheSizeMB / 2;
+
+    // Make sure we don't round down to 0
+    REQUIRE(smallCacheSizeMB > 0);
+
+    // Because we configure in MB, actual ratio won't be 0.5 because of rounding
+    // errors, so calculate it here
+    double expectedCachedRatio =
+        smallCacheSizeMB * 1024.0 * 1024.0 / approximateCacheSizeBytes;
+
+    runCacheTest(smallCacheSizeMB, checkPartialCacheSize, expectedCachedRatio);
+
+    REQUIRE(cachedAccountEntries >
+            totalAccountCount * (expectedCachedRatio - 0.15));
+    REQUIRE(cachedAccountEntries <
+            totalAccountCount * (expectedCachedRatio + 0.15));
+}
+
 TEST_CASE("do not load outdated values", "[bucket][bucketindex]")
 {
     auto f = [&](Config& cfg) {
         auto test = BucketIndexTest(cfg);
         test.buildMultiVersionTest();
         test.run();
+    };
+
+    testAllIndexTypes(f);
+}
+
+TEST_CASE("bucket entry counters", "[bucket][bucketindex]")
+{
+    // Initialize global counter for all of bucketlist
+    std::map<LedgerEntryTypeAndDurability, size_t> totalEntryTypeCounts;
+    std::map<LedgerEntryTypeAndDurability, size_t> totalEntryTypeSizes;
+    for (uint32_t type =
+             static_cast<uint32_t>(LedgerEntryTypeAndDurability::ACCOUNT);
+         type < static_cast<uint32_t>(LedgerEntryTypeAndDurability::NUM_TYPES);
+         ++type)
+    {
+        totalEntryTypeCounts[static_cast<LedgerEntryTypeAndDurability>(type)] =
+            0;
+        totalEntryTypeSizes[static_cast<LedgerEntryTypeAndDurability>(type)] =
+            0;
+    }
+
+    auto checkBucket = [&](auto bucket) {
+        if (bucket->isEmpty())
+        {
+            return;
+        }
+
+        // Local counter for each bucket
+        std::map<LedgerEntryTypeAndDurability, size_t> entryTypeCounts;
+        std::map<LedgerEntryTypeAndDurability, size_t> entryTypeSizes;
+        for (uint32_t type =
+                 static_cast<uint32_t>(LedgerEntryTypeAndDurability::ACCOUNT);
+             type <
+             static_cast<uint32_t>(LedgerEntryTypeAndDurability::NUM_TYPES);
+             ++type)
+        {
+            entryTypeCounts[static_cast<LedgerEntryTypeAndDurability>(type)] =
+                0;
+            entryTypeSizes[static_cast<LedgerEntryTypeAndDurability>(type)] = 0;
+        }
+
+        for (LiveBucketInputIterator iter(bucket); iter; ++iter)
+        {
+            auto be = *iter;
+            LedgerKey lk = getBucketLedgerKey(be);
+
+            auto count = [&](LedgerEntryTypeAndDurability type) {
+                entryTypeCounts[type]++;
+                entryTypeSizes[type] += xdr::xdr_size(be);
+                totalEntryTypeCounts[type]++;
+                totalEntryTypeSizes[type] += xdr::xdr_size(be);
+            };
+
+            switch (lk.type())
+            {
+            case ACCOUNT:
+                count(LedgerEntryTypeAndDurability::ACCOUNT);
+                break;
+            case TRUSTLINE:
+                count(LedgerEntryTypeAndDurability::TRUSTLINE);
+                break;
+            case OFFER:
+                count(LedgerEntryTypeAndDurability::OFFER);
+                break;
+            case DATA:
+                count(LedgerEntryTypeAndDurability::DATA);
+                break;
+            case CLAIMABLE_BALANCE:
+                count(LedgerEntryTypeAndDurability::CLAIMABLE_BALANCE);
+                break;
+            case LIQUIDITY_POOL:
+                count(LedgerEntryTypeAndDurability::LIQUIDITY_POOL);
+                break;
+            case CONTRACT_DATA:
+                if (isPersistentEntry(lk))
+                {
+                    count(
+                        LedgerEntryTypeAndDurability::PERSISTENT_CONTRACT_DATA);
+                }
+                else
+                {
+                    count(
+                        LedgerEntryTypeAndDurability::TEMPORARY_CONTRACT_DATA);
+                }
+                break;
+            case CONTRACT_CODE:
+                count(LedgerEntryTypeAndDurability::CONTRACT_CODE);
+                break;
+            case CONFIG_SETTING:
+                count(LedgerEntryTypeAndDurability::CONFIG_SETTING);
+                break;
+            case TTL:
+                count(LedgerEntryTypeAndDurability::TTL);
+                break;
+            }
+        }
+
+        auto const& indexCounters =
+            bucket->getIndexForTesting().getBucketEntryCounters();
+        REQUIRE(indexCounters.entryTypeCounts == entryTypeCounts);
+        REQUIRE(indexCounters.entryTypeSizes == entryTypeSizes);
+    };
+
+    auto f = [&](Config& cfg) {
+        auto test = BucketIndexTest(cfg);
+        test.buildMultiVersionTest();
+
+        for (auto i = 0; i < LiveBucketList::kNumLevels; ++i)
+        {
+            auto level = test.getBM().getLiveBucketList().getLevel(i);
+            checkBucket(level.getCurr());
+            checkBucket(level.getSnap());
+        }
+
+        auto summedCounters =
+            test.getBM().getLiveBucketList().sumBucketEntryCounters();
+        REQUIRE(summedCounters.entryTypeCounts == totalEntryTypeCounts);
+        REQUIRE(summedCounters.entryTypeSizes == totalEntryTypeSizes);
     };
 
     testAllIndexTypes(f);
@@ -608,7 +918,6 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
 
     // All levels use range config
     cfg.BUCKETLIST_DB_INDEX_CUTOFF = 0;
-    cfg.DEPRECATED_SQL_LEDGER_STATE = false;
     cfg.BUCKETLIST_DB_PERSIST_INDEX = true;
     cfg.INVARIANT_CHECKS = {};
 
@@ -619,8 +928,18 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
     auto test = BucketIndexTest(cfg, /*levels=*/3);
     test.buildGeneralTest();
 
-    auto buckets = test.getBM().getBucketListReferencedBuckets();
-    for (auto const& bucketHash : buckets)
+    std::set<Hash> liveBuckets;
+    auto& liveBL = test.getBM().getLiveBucketList();
+    for (auto i = 0; i < LiveBucketList::kNumLevels; ++i)
+    {
+        auto level = liveBL.getLevel(i);
+        for (auto const& b : {level.getCurr(), level.getSnap()})
+        {
+            liveBuckets.emplace(b->getHash());
+        }
+    }
+
+    for (auto const& bucketHash : liveBuckets)
     {
         if (isZero(bucketHash))
         {
@@ -631,15 +950,18 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         auto indexFilename = test.getBM().bucketIndexFilename(bucketHash);
         REQUIRE(fs::exists(indexFilename));
 
-        auto b = test.getBM().getBucketByHash(bucketHash);
+        auto b = test.getBM().getBucketByHash<LiveBucket>(bucketHash);
         REQUIRE(b->isIndexed());
 
         auto onDiskIndex =
-            BucketIndex::load(test.getBM(), indexFilename, b->getSize());
+            loadIndex<LiveBucket>(test.getBM(), indexFilename, b->getSize());
         REQUIRE(onDiskIndex);
 
         auto& inMemoryIndex = b->getIndexForTesting();
         REQUIRE((inMemoryIndex == *onDiskIndex));
+        auto inMemoryCounters = inMemoryIndex.getBucketEntryCounters();
+        auto onDiskCounters = onDiskIndex->getBucketEntryCounters();
+        REQUIRE(inMemoryCounters == onDiskCounters);
     }
 
     // Restart app with different config to test that indexes created with
@@ -649,7 +971,7 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
     cfg.BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT = 10;
     test.restartWithConfig(cfg);
 
-    for (auto const& bucketHash : buckets)
+    for (auto const& bucketHash : liveBuckets)
     {
         if (isZero(bucketHash))
         {
@@ -657,7 +979,7 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         }
 
         // Check if in-memory index has correct params
-        auto b = test.getBM().getBucketByHash(bucketHash);
+        auto b = test.getBM().getBucketByHash<LiveBucket>(bucketHash);
         REQUIRE(!b->isEmpty());
         REQUIRE(b->isIndexed());
 
@@ -667,8 +989,221 @@ TEST_CASE("serialize bucket indexes", "[bucket][bucketindex]")
         // Check if on-disk index rewritten with correct config params
         auto indexFilename = test.getBM().bucketIndexFilename(bucketHash);
         auto onDiskIndex =
-            BucketIndex::load(test.getBM(), indexFilename, b->getSize());
+            loadIndex<LiveBucket>(test.getBM(), indexFilename, b->getSize());
         REQUIRE((inMemoryIndex == *onDiskIndex));
     }
+}
+
+// The majority of BucketListDB functionality is shared by all bucketlist types.
+// This test is a simple sanity check and tests the interface differences
+// between the live bucketlist and the hot archive bucketlist.
+TEST_CASE("hot archive bucket lookups", "[bucket][bucketindex][archive]")
+{
+    auto f = [&](Config& cfg) {
+        auto clock = VirtualClock();
+        auto app = createTestApplication<BucketTestApplication>(clock, cfg);
+
+        UnorderedMap<LedgerKey, LedgerEntry> expectedArchiveEntries;
+        UnorderedSet<LedgerKey> expectedDeletedEntries;
+        UnorderedSet<LedgerKey> expectedRestoredEntries;
+        UnorderedSet<LedgerKey> keysToSearch;
+
+        auto ledger = 1;
+
+        // Use snapshot across ledger to test update behavior
+        auto searchableBL = app->getBucketManager()
+                                .getBucketSnapshotManager()
+                                .copySearchableHotArchiveBucketListSnapshot();
+
+        auto checkLoad =
+            [&](LedgerKey const& k,
+                std::shared_ptr<HotArchiveBucketEntry const> entryPtr) {
+                // Restored entries should be null
+                if (expectedRestoredEntries.find(k) !=
+                    expectedRestoredEntries.end())
+                {
+                    REQUIRE(!entryPtr);
+                }
+
+                // Deleted entries should be HotArchiveBucketEntry of type
+                // DELETED
+                else if (expectedDeletedEntries.find(k) !=
+                         expectedDeletedEntries.end())
+                {
+                    REQUIRE(entryPtr);
+                    REQUIRE(entryPtr->type() ==
+                            HotArchiveBucketEntryType::HOT_ARCHIVE_DELETED);
+                    REQUIRE(entryPtr->key() == k);
+                }
+
+                // Archived entries should contain full LedgerEntry
+                else
+                {
+                    auto expectedIter = expectedArchiveEntries.find(k);
+                    REQUIRE(expectedIter != expectedArchiveEntries.end());
+                    REQUIRE(entryPtr);
+                    REQUIRE(entryPtr->type() ==
+                            HotArchiveBucketEntryType::HOT_ARCHIVE_ARCHIVED);
+                    REQUIRE(entryPtr->archivedEntry() == expectedIter->second);
+                }
+            };
+
+        auto checkResult = [&] {
+            LedgerKeySet bulkLoadKeys;
+            for (auto const& k : keysToSearch)
+            {
+                auto entryPtr = searchableBL->load(k);
+                checkLoad(k, entryPtr);
+                bulkLoadKeys.emplace(k);
+            }
+
+            auto bulkLoadResult = searchableBL->loadKeys(bulkLoadKeys);
+            for (auto entry : bulkLoadResult)
+            {
+                if (entry.type() == HOT_ARCHIVE_DELETED)
+                {
+                    auto k = entry.key();
+                    auto iter = expectedDeletedEntries.find(k);
+                    REQUIRE(iter != expectedDeletedEntries.end());
+                    expectedDeletedEntries.erase(iter);
+                }
+                else
+                {
+                    REQUIRE(entry.type() == HOT_ARCHIVE_ARCHIVED);
+                    auto le = entry.archivedEntry();
+                    auto k = LedgerEntryKey(le);
+                    auto iter = expectedArchiveEntries.find(k);
+                    REQUIRE(iter != expectedArchiveEntries.end());
+                    REQUIRE(iter->second == le);
+                    expectedArchiveEntries.erase(iter);
+                }
+            }
+
+            REQUIRE(expectedDeletedEntries.empty());
+            REQUIRE(expectedArchiveEntries.empty());
+        };
+
+        auto archivedEntries =
+            LedgerTestUtils::generateValidUniqueLedgerEntriesWithTypes(
+                {CONTRACT_DATA, CONTRACT_CODE}, 10);
+        for (auto const& e : archivedEntries)
+        {
+            auto k = LedgerEntryKey(e);
+            expectedArchiveEntries.emplace(k, e);
+            keysToSearch.emplace(k);
+        }
+
+        // Note: keys to search automatically populated by these functions
+        auto deletedEntries =
+            LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
+                {CONTRACT_DATA, CONTRACT_CODE}, 10, keysToSearch);
+        for (auto const& k : deletedEntries)
+        {
+            expectedDeletedEntries.emplace(k);
+        }
+
+        auto restoredEntries =
+            LedgerTestUtils::generateValidUniqueLedgerKeysWithTypes(
+                {CONTRACT_DATA, CONTRACT_CODE}, 10, keysToSearch);
+        for (auto const& k : restoredEntries)
+        {
+            expectedRestoredEntries.emplace(k);
+        }
+
+        auto header =
+            app->getLedgerManager().getLastClosedLedgerHeader().header;
+        header.ledgerSeq += 1;
+        header.ledgerVersion = static_cast<uint32_t>(
+            HotArchiveBucket::FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION);
+        addHotArchiveBatchAndUpdateSnapshot(*app, header, archivedEntries,
+                                            restoredEntries, deletedEntries);
+        app->getBucketManager()
+            .getBucketSnapshotManager()
+            .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
+        checkResult();
+
+        // Add a few batches so that entries are no longer in the top bucket
+        for (auto i = 0; i < 100; ++i)
+        {
+            header.ledgerSeq += 1;
+            addHotArchiveBatchAndUpdateSnapshot(*app, header, {}, {}, {});
+            app->getBucketManager()
+                .getBucketSnapshotManager()
+                .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
+        }
+
+        // Shadow entries via liveEntry
+        auto liveShadow1 = LedgerEntryKey(archivedEntries[0]);
+        auto liveShadow2 = deletedEntries[1];
+
+        header.ledgerSeq += 1;
+        addHotArchiveBatchAndUpdateSnapshot(*app, header, {},
+                                            {liveShadow1, liveShadow2}, {});
+        app->getBucketManager()
+            .getBucketSnapshotManager()
+            .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
+
+        // Point load
+        for (auto const& k : {liveShadow1, liveShadow2})
+        {
+            auto entryPtr = searchableBL->load(k);
+            REQUIRE(!entryPtr);
+        }
+
+        // Bulk load
+        auto bulkLoadResult =
+            searchableBL->loadKeys({liveShadow1, liveShadow2});
+        REQUIRE(bulkLoadResult.size() == 0);
+
+        // Shadow via deletedEntry
+        auto deletedShadow = LedgerEntryKey(archivedEntries[1]);
+
+        header.ledgerSeq += 1;
+        addHotArchiveBatchAndUpdateSnapshot(*app, header, {}, {},
+                                            {deletedShadow});
+        app->getBucketManager()
+            .getBucketSnapshotManager()
+            .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
+
+        // Point load
+        auto entryPtr = searchableBL->load(deletedShadow);
+        REQUIRE(entryPtr);
+        REQUIRE(entryPtr->type() ==
+                HotArchiveBucketEntryType::HOT_ARCHIVE_DELETED);
+        REQUIRE(entryPtr->key() == deletedShadow);
+
+        // Bulk load
+        auto bulkLoadResult2 = searchableBL->loadKeys({deletedShadow});
+        REQUIRE(bulkLoadResult2.size() == 1);
+        REQUIRE(bulkLoadResult2[0].type() == HOT_ARCHIVE_DELETED);
+        REQUIRE(bulkLoadResult2[0].key() == deletedShadow);
+
+        // Shadow via archivedEntry
+        auto archivedShadow = archivedEntries[3];
+        archivedShadow.lastModifiedLedgerSeq = ledger;
+
+        header.ledgerSeq += 1;
+        addHotArchiveBatchAndUpdateSnapshot(*app, header, {archivedShadow}, {},
+                                            {});
+        app->getBucketManager()
+            .getBucketSnapshotManager()
+            .maybeCopySearchableHotArchiveBucketListSnapshot(searchableBL);
+
+        // Point load
+        entryPtr = searchableBL->load(LedgerEntryKey(archivedShadow));
+        REQUIRE(entryPtr);
+        REQUIRE(entryPtr->type() ==
+                HotArchiveBucketEntryType::HOT_ARCHIVE_ARCHIVED);
+        REQUIRE(entryPtr->archivedEntry() == archivedShadow);
+
+        // Bulk load
+        auto bulkLoadResult3 =
+            searchableBL->loadKeys({LedgerEntryKey(archivedShadow)});
+        REQUIRE(bulkLoadResult3.size() == 1);
+        REQUIRE(bulkLoadResult3[0].type() == HOT_ARCHIVE_ARCHIVED);
+        REQUIRE(bulkLoadResult3[0].archivedEntry() == archivedShadow);
+    };
+
+    testAllIndexTypes(f);
 }
 }

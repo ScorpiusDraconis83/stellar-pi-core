@@ -3,8 +3,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/NetworkConfig.h"
-#include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
+#include "bucket/LiveBucketList.h"
 #include "bucket/test/BucketTestUtils.h"
 #include "main/Application.h"
 #include "util/ProtocolVersion.h"
@@ -346,8 +346,11 @@ updateCpuCostParamsEntryForV21(AbstractLedgerTxn& ltxRoot)
                        .data.configSetting()
                        .contractCostParamsCpuInsns();
 
+    // Resize to fit the last cost type added in v21
+    params.resize(
+        static_cast<uint32>(ContractCostType::VerifyEcdsaSecp256r1Sig) + 1);
+
     auto const& vals = xdr::xdr_traits<ContractCostType>::enum_values();
-    params.resize(static_cast<uint32>(vals.size()));
 
     // While we loop over the full ContractCostType enum, we only set the range
     for (auto val : vals)
@@ -425,6 +428,119 @@ updateCpuCostParamsEntryForV21(AbstractLedgerTxn& ltxRoot)
             break;
         case VerifyEcdsaSecp256r1Sig:
             params[val] = ContractCostParamEntry{ExtensionPoint{0}, 3000906, 0};
+            break;
+        default:
+            break;
+        }
+    }
+    ltx.commit();
+}
+
+void
+updateCpuCostParamsEntryForV22(AbstractLedgerTxn& ltxRoot)
+{
+    LedgerTxn ltx(ltxRoot);
+
+    LedgerKey key(CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS;
+
+    auto& params = ltx.load(key)
+                       .current()
+                       .data.configSetting()
+                       .contractCostParamsCpuInsns();
+
+    auto const& vals = xdr::xdr_traits<ContractCostType>::enum_values();
+
+    // Resize to fit the last cost type added in v22
+    params.resize(static_cast<uint32>(ContractCostType::Bls12381FrInv) + 1);
+
+    // While we loop over the full ContractCostType enum, we only set the
+    // entries that have either been updated, or newly created in p22
+    for (auto val : vals)
+    {
+        switch (val)
+        {
+        // adding new cost types introduced in p22
+        case Bls12381EncodeFp:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 661, 0);
+            break;
+        case Bls12381DecodeFp:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 985, 0);
+            break;
+        case Bls12381G1CheckPointOnCurve:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 1934, 0);
+            break;
+        case Bls12381G1CheckPointInSubgroup:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 730510, 0);
+            break;
+        case Bls12381G2CheckPointOnCurve:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 5921, 0);
+            break;
+        case Bls12381G2CheckPointInSubgroup:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 1057822, 0);
+            break;
+        case Bls12381G1ProjectiveToAffine:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 92642, 0);
+            break;
+        case Bls12381G2ProjectiveToAffine:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 100742, 0);
+            break;
+        case Bls12381G1Add:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 7689, 0);
+            break;
+        case Bls12381G1Mul:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 2458985, 0);
+            break;
+        case Bls12381G1Msm:
+            params[val] =
+                ContractCostParamEntry(ExtensionPoint{0}, 2426722, 96397671);
+            break;
+        case Bls12381MapFpToG1:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 1541554, 0);
+            break;
+        case Bls12381HashToG1:
+            params[val] =
+                ContractCostParamEntry(ExtensionPoint{0}, 3211191, 6713);
+            break;
+        case Bls12381G2Add:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 25207, 0);
+            break;
+        case Bls12381G2Mul:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 7873219, 0);
+            break;
+        case Bls12381G2Msm:
+            params[val] =
+                ContractCostParamEntry(ExtensionPoint{0}, 8035968, 309667335);
+            break;
+        case Bls12381MapFp2ToG2:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 2420202, 0);
+            break;
+        case Bls12381HashToG2:
+            params[val] =
+                ContractCostParamEntry(ExtensionPoint{0}, 7050564, 6797);
+            break;
+        case Bls12381Pairing:
+            params[val] =
+                ContractCostParamEntry(ExtensionPoint{0}, 10558948, 632860943);
+            break;
+        case Bls12381FrFromU256:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 1994, 0);
+            break;
+        case Bls12381FrToU256:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 1155, 0);
+            break;
+        case Bls12381FrAddSub:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 74, 0);
+            break;
+        case Bls12381FrMul:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 332, 0);
+            break;
+        case Bls12381FrPow:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 691, 74558);
+            break;
+        case Bls12381FrInv:
+            params[val] = ContractCostParamEntry(ExtensionPoint{0}, 35421, 0);
             break;
         default:
             break;
@@ -593,8 +709,11 @@ updateMemCostParamsEntryForV21(AbstractLedgerTxn& ltxRoot)
                        .data.configSetting()
                        .contractCostParamsMemBytes();
 
+    // Resize to fit the last cost type added in v21
+    params.resize(
+        static_cast<uint32>(ContractCostType::VerifyEcdsaSecp256r1Sig) + 1);
+
     auto const& vals = xdr::xdr_traits<ContractCostType>::enum_values();
-    params.resize(static_cast<uint32>(vals.size()));
 
     for (auto val : vals)
     {
@@ -681,6 +800,128 @@ updateMemCostParamsEntryForV21(AbstractLedgerTxn& ltxRoot)
     ltx.commit();
 }
 
+void
+updateMemCostParamsEntryForV22(AbstractLedgerTxn& ltxRoot)
+{
+    LedgerTxn ltx(ltxRoot);
+
+    LedgerKey key(CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES;
+
+    auto& params = ltx.load(key)
+                       .current()
+                       .data.configSetting()
+                       .contractCostParamsMemBytes();
+
+    auto const& vals = xdr::xdr_traits<ContractCostType>::enum_values();
+
+    // Resize to fit the last cost type added in v22
+    params.resize(static_cast<uint32>(ContractCostType::Bls12381FrInv) + 1);
+
+    for (auto val : vals)
+    {
+        switch (val)
+        {
+        // adding new cost types introduced in p22
+        case Bls12381EncodeFp:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381DecodeFp:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1CheckPointOnCurve:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1CheckPointInSubgroup:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G2CheckPointOnCurve:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G2CheckPointInSubgroup:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1ProjectiveToAffine:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G2ProjectiveToAffine:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1Add:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1Mul:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G1Msm:
+            params[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 109494, 354667};
+            break;
+        case Bls12381MapFpToG1:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 5552, 0};
+            break;
+        case Bls12381HashToG1:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 9424, 0};
+            break;
+        case Bls12381G2Add:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G2Mul:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381G2Msm:
+            params[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 219654, 354667};
+            break;
+        case Bls12381MapFp2ToG2:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 3344, 0};
+            break;
+        case Bls12381HashToG2:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 6816, 0};
+            break;
+        case Bls12381Pairing:
+            params[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 2204, 9340474};
+            break;
+        case Bls12381FrFromU256:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381FrToU256:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 248, 0};
+            break;
+        case Bls12381FrAddSub:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381FrMul:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+        case Bls12381FrPow:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 128};
+            break;
+        case Bls12381FrInv:
+            params[val] = ContractCostParamEntry{ExtensionPoint{0}, 0, 0};
+            break;
+
+        default:
+            break;
+        }
+    }
+
+    ltx.commit();
+}
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+ConfigSettingEntry
+initialParallelComputeEntry()
+{
+    ConfigSettingEntry entry(CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0);
+    entry.contractParallelCompute().ledgerMaxDependentTxClusters =
+        InitialSorobanNetworkConfig::LEDGER_MAX_DEPENDENT_TX_CLUSTERS;
+    return entry;
+}
+#endif
+
 ConfigSettingEntry
 initialBucketListSizeWindow(Application& app)
 {
@@ -690,7 +931,7 @@ initialBucketListSizeWindow(Application& app)
     // copies of the current BL size. If the bucketlist is disabled for
     // testing, just fill with ones to avoid triggering asserts.
     auto blSize = app.getConfig().MODE_ENABLES_BUCKETLIST
-                      ? app.getBucketManager().getBucketList().getSize()
+                      ? app.getBucketManager().getLiveBucketList().getSize()
                       : 1;
     for (uint64_t i = 0;
          i < InitialSorobanNetworkConfig::BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE;
@@ -816,7 +1057,7 @@ SorobanNetworkConfig::isValidConfigSettingEntry(ConfigSettingEntry const& cfg,
             cfg.stateArchivalSettings().startingEvictionScanLevel >=
                 MinimumSorobanNetworkConfig::STARTING_EVICTION_LEVEL &&
             cfg.stateArchivalSettings().startingEvictionScanLevel <
-                BucketList::kNumLevels &&
+                LiveBucketList::kNumLevels &&
             cfg.stateArchivalSettings().bucketListWindowSamplePeriod >=
                 MinimumSorobanNetworkConfig::BUCKETLIST_WINDOW_SAMPLE_PERIOD;
 
@@ -828,6 +1069,15 @@ SorobanNetworkConfig::isValidConfigSettingEntry(ConfigSettingEntry const& cfg,
     case ConfigSettingID::CONFIG_SETTING_BUCKETLIST_SIZE_WINDOW:
     case ConfigSettingID::CONFIG_SETTING_EVICTION_ITERATOR:
         valid = true;
+        break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    case ConfigSettingID::CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0:
+        valid = protocolVersionStartsFrom(
+                    ledgerVersion, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION) &&
+                cfg.contractParallelCompute().ledgerMaxDependentTxClusters > 0;
+        break;
+#endif
+    default:
         break;
     }
     return valid;
@@ -905,6 +1155,25 @@ SorobanNetworkConfig::createCostTypesForV21(AbstractLedgerTxn& ltx,
 }
 
 void
+SorobanNetworkConfig::createCostTypesForV22(AbstractLedgerTxn& ltx,
+                                            Application& app)
+{
+    ZoneScoped;
+    updateCpuCostParamsEntryForV22(ltx);
+    updateMemCostParamsEntryForV22(ltx);
+}
+
+void
+SorobanNetworkConfig::createLedgerEntriesForV23(AbstractLedgerTxn& ltx,
+                                                Application& app)
+{
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    ZoneScoped;
+    createConfigSettingEntry(initialParallelComputeEntry(), ltx,
+                             static_cast<uint32_t>(ProtocolVersion::V_23));
+#endif
+}
+void
 SorobanNetworkConfig::initializeGenesisLedgerForTesting(
     uint32_t genesisLedgerProtocol, AbstractLedgerTxn& ltx, Application& app)
 {
@@ -917,12 +1186,27 @@ SorobanNetworkConfig::initializeGenesisLedgerForTesting(
         ltx.loadHeader().current().ledgerVersion =
             static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION);
         SorobanNetworkConfig::createLedgerEntriesForV20(ltx, app);
+        // Protocol 20 released with somewhat incorrect costs and has been
+        // re-calibrated short after the release. We catch up here to the more
+        // correct costs that exist on the network.
+#ifdef BUILD_TESTS
+        updateRecalibratedCostTypesForV20(ltx);
+#endif
         ltx.loadHeader().current().ledgerVersion = genesisLedgerProtocol;
     }
 
     if (protocolVersionStartsFrom(genesisLedgerProtocol, ProtocolVersion::V_21))
     {
         SorobanNetworkConfig::createCostTypesForV21(ltx, app);
+    }
+
+    if (protocolVersionStartsFrom(genesisLedgerProtocol, ProtocolVersion::V_22))
+    {
+        SorobanNetworkConfig::createCostTypesForV22(ltx, app);
+    }
+    if (protocolVersionStartsFrom(genesisLedgerProtocol, ProtocolVersion::V_23))
+    {
+        SorobanNetworkConfig::createLedgerEntriesForV23(ltx, app);
     }
 }
 
@@ -933,7 +1217,7 @@ SorobanNetworkConfig::loadFromLedger(AbstractLedgerTxn& ltxRoot,
 {
     ZoneScoped;
 
-    LedgerTxn ltx(ltxRoot, false, TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
+    LedgerTxn ltx(ltxRoot);
     loadMaxContractSize(ltx);
     loadMaxContractDataKeySize(ltx);
     loadMaxContractDataEntrySize(ltx);
@@ -950,6 +1234,11 @@ SorobanNetworkConfig::loadFromLedger(AbstractLedgerTxn& ltxRoot,
     loadEvictionIterator(ltx);
     // NB: this should follow loading state archival settings
     maybeUpdateBucketListWindowSize(ltx);
+    if (protocolVersionStartsFrom(protocolVersion,
+                                  PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION))
+    {
+        loadParallelComputeConfig(ltx);
+    }
     // NB: this should follow loading/updating bucket list window
     // size and state archival settings
     computeWriteFee(configMaxProtocol, protocolVersion);
@@ -1151,6 +1440,21 @@ SorobanNetworkConfig::loadEvictionIterator(AbstractLedgerTxn& ltx)
     auto txle = ltx.loadWithoutRecord(key);
     releaseAssert(txle);
     mEvictionIterator = txle.current().data.configSetting().evictionIterator();
+}
+
+void
+SorobanNetworkConfig::loadParallelComputeConfig(AbstractLedgerTxn& ltx)
+{
+    ZoneScoped;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    LedgerKey key(CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0;
+    auto le = ltx.loadWithoutRecord(key).current();
+    auto const& configSetting =
+        le.data.configSetting().contractParallelCompute();
+    mLedgerMaxDependentTxClusters = configSetting.ledgerMaxDependentTxClusters;
+#endif
 }
 
 void
@@ -1454,7 +1758,7 @@ SorobanNetworkConfig::maybeSnapshotBucketListSize(uint32_t currLedger,
         // Update in memory snapshots
         mBucketListSizeSnapshots.pop_front();
         mBucketListSizeSnapshots.push_back(
-            app.getBucketManager().getBucketList().getSize());
+            app.getBucketManager().getLiveBucketList().getSize());
 
         writeBucketListSizeWindow(ltx);
         updateBucketListSizeAverage();
@@ -1615,15 +1919,27 @@ SorobanNetworkConfig::writeAllSettings(AbstractLedgerTxn& ltx,
     releaseAssert(iterTxle);
     entries.push_back(iterTxle.current());
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+    if (protocolVersionStartsFrom(ltx.loadHeader().current().ledgerVersion,
+                                  PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION))
+    {
+        ConfigSettingEntry parallelComputeEntry(
+            CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0);
+        parallelComputeEntry.contractParallelCompute()
+            .ledgerMaxDependentTxClusters = mLedgerMaxDependentTxClusters;
+        entries.emplace_back(
+            writeConfigSettingEntry(parallelComputeEntry, ltx, app));
+    }
+#endif
+
     // If testing with BucketListDB, we need to commit directly to the
     // BucketList
-    if (app.getConfig().isUsingBucketListDB())
+    if (!app.getConfig().MODE_USES_IN_MEMORY_LEDGER)
     {
         auto lcl = app.getLedgerManager().getLastClosedLedgerHeader();
         lcl.header.ledgerSeq += 1;
-        BucketTestUtils::addBatchAndUpdateSnapshot(
-            app.getBucketManager().getBucketList(), app, lcl.header, {},
-            entries, {});
+        BucketTestUtils::addLiveBatchAndUpdateSnapshot(app, lcl.header, {},
+                                                       entries, {});
     }
 }
 #endif
@@ -1671,6 +1987,25 @@ SorobanNetworkConfig::updateEvictionIterator(
     ltx.commit();
 }
 
+uint32_t
+SorobanNetworkConfig::ledgerMaxDependentTxClusters() const
+{
+    return mLedgerMaxDependentTxClusters;
+}
+
+Resource
+SorobanNetworkConfig::maxLedgerResources() const
+{
+    std::vector<int64_t> limits = {ledgerMaxTxCount(),
+                                   ledgerMaxInstructions(),
+                                   ledgerMaxTransactionSizesBytes(),
+                                   ledgerMaxReadBytes(),
+                                   ledgerMaxWriteBytes(),
+                                   ledgerMaxReadLedgerEntries(),
+                                   ledgerMaxWriteLedgerEntries()};
+    return Resource(limits);
+}
+
 #ifdef BUILD_TESTS
 StateArchivalSettings&
 SorobanNetworkConfig::stateArchivalSettings()
@@ -1683,17 +2018,149 @@ SorobanNetworkConfig::evictionIterator()
 {
     return mEvictionIterator;
 }
+
+void
+SorobanNetworkConfig::updateRecalibratedCostTypesForV20(
+    AbstractLedgerTxn& ltxRoot)
+{
+    LedgerTxn ltx(ltxRoot);
+
+    LedgerKey key(CONFIG_SETTING);
+    key.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS;
+
+    auto& cpuParams = ltx.load(key)
+                          .current()
+                          .data.configSetting()
+                          .contractCostParamsCpuInsns();
+
+    for (size_t val = 0; val < cpuParams.size(); ++val)
+    {
+        switch (val)
+        {
+        case DispatchHostFunction:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 295, 0};
+            break;
+        case VisitObject:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 60, 0};
+            break;
+        case ValSer:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 221, 26};
+            break;
+        case ValDeser:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 331, 4369};
+            break;
+        case ComputeSha256Hash:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 3636, 7013};
+            break;
+        case ComputeEd25519PubKey:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 40256, 0};
+            break;
+        case VerifyEd25519Sig:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 377551, 4059};
+            break;
+        case VmInstantiation:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 417482, 45712};
+            break;
+        case VmCachedInstantiation:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 417482, 45712};
+            break;
+        case InvokeVmFunction:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 1945, 0};
+            break;
+        case ComputeKeccak256Hash:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 6481, 5943};
+            break;
+        case DecodeEcdsaCurve256Sig:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 711, 0};
+            break;
+        case RecoverEcdsaSecp256k1Key:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 2314804, 0};
+            break;
+        case Int256AddSub:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 4176, 0};
+            break;
+        case Int256Mul:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 4716, 0};
+            break;
+        case Int256Div:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 4680, 0};
+            break;
+        case Int256Pow:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 4256, 0};
+            break;
+        case Int256Shift:
+            cpuParams[val] = ContractCostParamEntry{ExtensionPoint{0}, 884, 0};
+            break;
+        case ChaCha20DrawBytes:
+            cpuParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 1059, 502};
+            break;
+        default:
+            break;
+        }
+    }
+
+    LedgerKey memKey(CONFIG_SETTING);
+    memKey.configSetting().configSettingID =
+        ConfigSettingID::CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES;
+
+    auto& memParams = ltx.load(memKey)
+                          .current()
+                          .data.configSetting()
+                          .contractCostParamsMemBytes();
+    for (size_t val = 0; val < memParams.size(); ++val)
+    {
+        switch (val)
+        {
+        case VmInstantiation:
+            memParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 132773, 4903};
+            break;
+        case VmCachedInstantiation:
+            memParams[val] =
+                ContractCostParamEntry{ExtensionPoint{0}, 132773, 4903};
+            break;
+        default:
+            break;
+        }
+    }
+
+    ltx.commit();
+}
 #endif
 
 bool
 SorobanNetworkConfig::isValidCostParams(ContractCostParams const& params,
                                         uint32_t ledgerVersion)
 {
-    auto numberOfCostTypes =
-        protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_21)
-            ? static_cast<uint32_t>(ContractCostType::ChaCha20DrawBytes) + 1
-            : xdr::xdr_traits<ContractCostType>::enum_values().size();
-    if (params.size() != numberOfCostTypes)
+    auto getNumCostTypes = [](uint32_t ledgerVersion) -> uint32_t {
+        if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_21))
+        {
+            return static_cast<uint32_t>(ContractCostType::ChaCha20DrawBytes) +
+                   1;
+        }
+        else if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_22))
+        {
+            return static_cast<uint32_t>(
+                       ContractCostType::VerifyEcdsaSecp256r1Sig) +
+                   1;
+        }
+        else
+        {
+            return static_cast<uint32_t>(ContractCostType::Bls12381FrInv) + 1;
+        }
+    };
+
+    if (params.size() != getNumCostTypes(ledgerVersion))
     {
         return false;
     }

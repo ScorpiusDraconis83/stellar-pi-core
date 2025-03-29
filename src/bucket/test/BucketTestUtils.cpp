@@ -5,11 +5,16 @@
 #include "BucketTestUtils.h"
 #include "bucket/BucketInputIterator.h"
 #include "bucket/BucketManager.h"
+#include "bucket/HotArchiveBucket.h"
+#include "bucket/LiveBucket.h"
 #include "crypto/Hex.h"
 #include "herder/Herder.h"
 #include "ledger/LedgerTxn.h"
 #include "main/Application.h"
 #include "test/test.h"
+#include "util/ProtocolVersion.h"
+#include "xdr/Stellar-ledger.h"
+#include <memory>
 
 namespace stellar
 {
@@ -30,18 +35,43 @@ getAppLedgerVersion(Application::pointer app)
 }
 
 void
-addBatchAndUpdateSnapshot(BucketList& bl, Application& app, LedgerHeader header,
-                          std::vector<LedgerEntry> const& initEntries,
-                          std::vector<LedgerEntry> const& liveEntries,
-                          std::vector<LedgerKey> const& deadEntries)
+addLiveBatchAndUpdateSnapshot(Application& app, LedgerHeader header,
+                              std::vector<LedgerEntry> const& initEntries,
+                              std::vector<LedgerEntry> const& liveEntries,
+                              std::vector<LedgerKey> const& deadEntries)
 {
-    bl.addBatch(app, header.ledgerSeq, header.ledgerVersion, initEntries,
-                liveEntries, deadEntries);
-    if (app.getConfig().isUsingBucketListDB())
-    {
-        app.getBucketManager().getBucketSnapshotManager().updateCurrentSnapshot(
-            std::make_unique<BucketListSnapshot>(bl, header));
-    }
+    auto& liveBl = app.getBucketManager().getLiveBucketList();
+    liveBl.addBatch(app, header.ledgerSeq, header.ledgerVersion, initEntries,
+                    liveEntries, deadEntries);
+
+    auto liveSnapshot =
+        std::make_unique<BucketListSnapshot<LiveBucket>>(liveBl, header);
+    auto hotArchiveSnapshot =
+        std::make_unique<BucketListSnapshot<HotArchiveBucket>>(
+            app.getBucketManager().getHotArchiveBucketList(), header);
+
+    app.getBucketManager().getBucketSnapshotManager().updateCurrentSnapshot(
+        std::move(liveSnapshot), std::move(hotArchiveSnapshot));
+}
+
+void
+addHotArchiveBatchAndUpdateSnapshot(
+    Application& app, LedgerHeader header,
+    std::vector<LedgerEntry> const& archiveEntries,
+    std::vector<LedgerKey> const& restoredEntries,
+    std::vector<LedgerKey> const& deletedEntries)
+{
+    auto& hotArchiveBl = app.getBucketManager().getHotArchiveBucketList();
+    hotArchiveBl.addBatch(app, header.ledgerSeq, header.ledgerVersion,
+                          archiveEntries, restoredEntries, deletedEntries);
+    auto liveSnapshot = std::make_unique<BucketListSnapshot<LiveBucket>>(
+        app.getBucketManager().getLiveBucketList(), header);
+    auto hotArchiveSnapshot =
+        std::make_unique<BucketListSnapshot<HotArchiveBucket>>(hotArchiveBl,
+                                                               header);
+
+    app.getBucketManager().getBucketSnapshotManager().updateCurrentSnapshot(
+        std::move(liveSnapshot), std::move(hotArchiveSnapshot));
 }
 
 void
@@ -50,19 +80,12 @@ for_versions_with_differing_bucket_logic(
 {
     for_versions(
         {static_cast<uint32_t>(
-             Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
+             LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY) -
              1,
          static_cast<uint32_t>(
-             Bucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
-         static_cast<uint32_t>(Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED)},
+             LiveBucket::FIRST_PROTOCOL_SUPPORTING_INITENTRY_AND_METAENTRY),
+         static_cast<uint32_t>(LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED)},
         cfg, f);
-}
-
-size_t
-countEntries(std::shared_ptr<Bucket> bucket)
-{
-    EntryCounts e(bucket);
-    return e.sum();
 }
 
 Hash
@@ -74,10 +97,15 @@ closeLedger(Application& app, std::optional<SecretKey> skToSignValue,
     uint32_t ledgerNum = lcl.header.ledgerSeq + 1;
     CLOG_INFO(Bucket, "Artificially closing ledger {} with lcl={}, buckets={}",
               ledgerNum, hexAbbrev(lcl.hash),
-              hexAbbrev(app.getBucketManager().getBucketList().getHash()));
+              hexAbbrev(app.getBucketManager().getLiveBucketList().getHash()));
     app.getHerder().externalizeValue(TxSetXDRFrame::makeEmpty(lcl), ledgerNum,
                                      lcl.header.scpValue.closeTime, upgrades,
                                      skToSignValue);
+    // NB: this assert will probably stop being true when background apply is
+    // turned on by default: externalize will have handed the ledger off to
+    // apply but not yet received the results of apply or updated LCL. The fix
+    // should be just to crank here until LCL advances to ledgerSeq.
+    releaseAssert(lm.getLastClosedLedgerNum() == ledgerNum);
     return lm.getLastClosedLedgerHeader().hash;
 }
 
@@ -87,9 +115,10 @@ closeLedger(Application& app)
     return closeLedger(app, std::nullopt);
 }
 
-EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket)
+template <>
+EntryCounts<LiveBucket>::EntryCounts(std::shared_ptr<LiveBucket> bucket)
 {
-    BucketInputIterator iter(bucket);
+    LiveBucketInputIterator iter(bucket);
     if (iter.seenMetadata())
     {
         ++nMeta;
@@ -99,7 +128,7 @@ EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket)
         switch ((*iter).type())
         {
         case INITENTRY:
-            ++nInit;
+            ++nInitOrArchived;
             break;
         case LIVEENTRY:
             ++nLive;
@@ -116,8 +145,50 @@ EntryCounts::EntryCounts(std::shared_ptr<Bucket> bucket)
     }
 }
 
+template <>
+EntryCounts<HotArchiveBucket>::EntryCounts(
+    std::shared_ptr<HotArchiveBucket> bucket)
+{
+    HotArchiveBucketInputIterator iter(bucket);
+    if (iter.seenMetadata())
+    {
+        ++nMeta;
+    }
+    while (iter)
+    {
+        switch ((*iter).type())
+        {
+        case HOT_ARCHIVE_ARCHIVED:
+            ++nInitOrArchived;
+            break;
+        case HOT_ARCHIVE_LIVE:
+            ++nLive;
+            break;
+        case HOT_ARCHIVE_DELETED:
+            ++nDead;
+            break;
+        case HOT_ARCHIVE_METAENTRY:
+            // This should never happen: only the first record can be METAENTRY
+            // and it is counted above.
+            abort();
+        }
+        ++iter;
+    }
+}
+
+template <class BucketT>
+size_t
+countEntries(std::shared_ptr<BucketT> bucket)
+{
+    EntryCounts e(bucket);
+    return e.sum();
+}
+
+template size_t countEntries(std::shared_ptr<LiveBucket> bucket);
+template size_t countEntries(std::shared_ptr<HotArchiveBucket> bucket);
+
 void
-LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
+LedgerManagerForBucketTests::sealLedgerTxnAndTransferEntriesToBucketList(
     AbstractLedgerTxn& ltx,
     std::unique_ptr<LedgerCloseMetaFrame> const& ledgerCloseMeta,
     LedgerHeader lh, uint32_t initialLedgerVers)
@@ -163,26 +234,42 @@ LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
                 }
 
                 LedgerTxn ltxEvictions(ltx);
-                if (mApp.getConfig().isUsingBackgroundEviction())
-                {
+
+                auto evictedState =
                     mApp.getBucketManager().resolveBackgroundEvictionScan(
-                        ltxEvictions, lh.ledgerSeq, keys);
-                }
-                else
+                        ltxEvictions, lh.ledgerSeq, keys, initialLedgerVers,
+                        mApp.getLedgerManager()
+                            .getSorobanNetworkConfigForApply());
+                if (protocolVersionStartsFrom(
+                        initialLedgerVers,
+                        LiveBucket::
+                            FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION))
                 {
-                    mApp.getBucketManager().scanForEvictionLegacy(ltxEvictions,
-                                                                  lh.ledgerSeq);
+                    std::vector<LedgerKey> restoredKeys;
+                    auto restoredKeysMap = ltx.getRestoredHotArchiveKeys();
+                    for (auto const& key : restoredKeysMap)
+                    {
+                        // Hot Archive does not track TTLs
+                        if (key.type() == CONTRACT_DATA ||
+                            key.type() == CONTRACT_CODE)
+                        {
+                            restoredKeys.emplace_back(key);
+                        }
+                    }
+                    mApp.getBucketManager().addHotArchiveBatch(
+                        mApp, lh, evictedState.archivedEntries, restoredKeys,
+                        {});
                 }
 
                 if (ledgerCloseMeta)
                 {
-                    ledgerCloseMeta->populateEvictedEntries(
-                        ltxEvictions.getChanges());
+                    ledgerCloseMeta->populateEvictedEntries(evictedState);
                 }
+
                 ltxEvictions.commit();
             }
             mApp.getLedgerManager()
-                .getMutableSorobanNetworkConfig()
+                .getMutableSorobanNetworkConfigForApply()
                 .maybeSnapshotBucketListSize(lh.ledgerSeq, ltx, mApp);
         }
 
@@ -191,8 +278,7 @@ LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
         // Add dead entries from ltx to entries that will be added to BucketList
         // so we can test background eviction properly
         if (protocolVersionStartsFrom(initialLedgerVers,
-                                      SOROBAN_PROTOCOL_VERSION) &&
-            mApp.getConfig().isUsingBackgroundEviction())
+                                      SOROBAN_PROTOCOL_VERSION))
         {
             for (auto const& k : dead)
             {
@@ -201,13 +287,13 @@ LedgerManagerForBucketTests::transferLedgerEntriesToBucketList(
         }
 
         // Use the testing values.
-        mApp.getBucketManager().addBatch(mApp, lh, mTestInitEntries,
-                                         mTestLiveEntries, mTestDeadEntries);
+        mApp.getBucketManager().addLiveBatch(
+            mApp, lh, mTestInitEntries, mTestLiveEntries, mTestDeadEntries);
         mUseTestEntries = false;
     }
     else
     {
-        LedgerManagerImpl::transferLedgerEntriesToBucketList(
+        LedgerManagerImpl::sealLedgerTxnAndTransferEntriesToBucketList(
             ltx, ledgerCloseMeta, lh, initialLedgerVers);
     }
 }

@@ -4,14 +4,17 @@
 
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
+#include "ledger/LedgerManager.h"
 #include "lib/catch.hpp"
 #include "main/Config.h"
 #include "scp/QuorumSetUtils.h"
+#include "simulation/ApplyLoad.h"
 #include "simulation/LoadGenerator.h"
 #include "simulation/Topologies.h"
 #include "test/test.h"
 #include "transactions/test/SorobanTxTestUtils.h"
 #include "util/Math.h"
+#include "util/finally.h"
 #include <fmt/format.h>
 
 using namespace stellar;
@@ -24,7 +27,6 @@ TEST_CASE("generate load in protocol 1")
             auto cfg = getTestConfig(i);
             cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 5000;
             cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = 1;
-            cfg.DEPRECATED_SQL_LEDGER_STATE = false;
             return cfg;
         });
 
@@ -52,10 +54,16 @@ TEST_CASE("generate load in protocol 1")
 TEST_CASE("generate load with unique accounts", "[loadgen]")
 {
     Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    uint32_t const nAccounts = 1000;
+    uint32_t const nTxs = 100000;
+
     Simulation::pointer simulation =
-        Topologies::pair(Simulation::OVER_LOOPBACK, networkID, [](int i) {
+        Topologies::pair(Simulation::OVER_LOOPBACK, networkID, [&](int i) {
             auto cfg = getTestConfig(i);
             cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 5000;
+            cfg.LOADGEN_OP_COUNT_FOR_TESTING = {1, 2, 10};
+            cfg.LOADGEN_OP_COUNT_DISTRIBUTION_FOR_TESTING = {80, 19, 1};
+            cfg.GENESIS_TEST_ACCOUNT_COUNT = nAccounts * 10;
             return cfg;
         });
 
@@ -67,48 +75,56 @@ TEST_CASE("generate load with unique accounts", "[loadgen]")
     auto nodes = simulation->getNodes();
     auto& app = *nodes[0]; // pick a node to generate load
 
+    std::string fileName =
+        app.getConfig().LOADGEN_PREGENERATED_TRANSACTIONS_FILE;
+    auto cleanup = gsl::finally([&]() { std::remove(fileName.c_str()); });
+
+    generateTransactions(app, fileName, nTxs, nAccounts,
+                         /* offset */ nAccounts);
+
     auto& loadGen = app.getLoadGenerator();
 
-    SECTION("success")
+    auto getSuccessfulTxCount = [&]() {
+        return nodes[0]
+            ->getMetrics()
+            .NewCounter({"ledger", "apply", "success"})
+            .count();
+    };
+
+    SECTION("pregenerated transactions")
     {
-        loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
-            /* nAccounts */ 10000,
-            /* txRate */ 1));
+        auto const& cfg = app.getConfig();
+        loadGen.generateLoad(GeneratedLoadConfig::pregeneratedTxLoad(
+            nAccounts, /* nTxs */ nTxs, /* txRate */ 50,
+            /* offset*/ nAccounts, cfg.LOADGEN_PREGENERATED_TRANSACTIONS_FILE));
         simulation->crankUntil(
             [&]() {
                 return app.getMetrics()
                            .NewMeter({"loadgen", "run", "complete"}, "run")
                            .count() == 1;
             },
-            100 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+            500 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+        REQUIRE(getSuccessfulTxCount() == nTxs);
+    }
+    SECTION("success")
+    {
+        uint32_t const nTxs = 10000;
 
         loadGen.generateLoad(GeneratedLoadConfig::txLoad(LoadGenMode::PAY,
-                                                         /* nAccounts */ 10000,
-                                                         /* nTxs */ 10000,
-                                                         /* txRate */ 10));
+                                                         nAccounts, nTxs,
+                                                         /* txRate */ 50));
         simulation->crankUntil(
             [&]() {
                 return app.getMetrics()
                            .NewMeter({"loadgen", "run", "complete"}, "run")
-                           .count() == 2;
+                           .count() == 1;
             },
             300 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+        REQUIRE(getSuccessfulTxCount() == nTxs);
     }
     SECTION("invalid loadgen parameters")
     {
-        // Succesfully create accounts
         uint32 numAccounts = 100;
-        loadGen.generateLoad(GeneratedLoadConfig::createAccountsLoad(
-            /* nAccounts */ 100,
-            /* txRate */ 1));
-        simulation->crankUntil(
-            [&]() {
-                return app.getMetrics()
-                           .NewMeter({"loadgen", "run", "complete"}, "run")
-                           .count() == 1;
-            },
-            100 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
-
         loadGen.generateLoad(
             GeneratedLoadConfig::txLoad(LoadGenMode::PAY,
                                         /* nAccounts */ numAccounts,
@@ -121,6 +137,27 @@ TEST_CASE("generate load with unique accounts", "[loadgen]")
                            .count() == 1;
             },
             10 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+    }
+    SECTION("stop loadgen")
+    {
+        loadGen.generateLoad(GeneratedLoadConfig::txLoad(LoadGenMode::PAY,
+                                                         /* nAccounts */ 1000,
+                                                         /* nTxs */ 1000 * 2,
+                                                         /* txRate */ 1));
+        simulation->crankForAtLeast(std::chrono::seconds(10), false);
+        auto& acc = app.getMetrics().NewMeter({"loadgen", "account", "created"},
+                                              "account");
+        auto numAccounts = acc.count();
+        REQUIRE(app.getMetrics()
+                    .NewMeter({"loadgen", "run", "failed"}, "run")
+                    .count() == 0);
+        loadGen.stop();
+        REQUIRE(app.getMetrics()
+                    .NewMeter({"loadgen", "run", "failed"}, "run")
+                    .count() == 1);
+        // No new txs submitted
+        simulation->crankForAtLeast(std::chrono::seconds(10), false);
+        REQUIRE(acc.count() == numAccounts);
     }
 }
 
@@ -176,8 +213,10 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
     Simulation::pointer simulation =
         Topologies::pair(Simulation::OVER_LOOPBACK, networkID, [&](int i) {
             auto cfg = getTestConfig(i);
-            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 5000;
-            // Use tight bounds to we can verify storage works properly
+            cfg.USE_CONFIG_FOR_GENESIS = false;
+            cfg.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true;
+            cfg.UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING = true;
+            //  Use tight bounds to we can verify storage works properly
             cfg.LOADGEN_NUM_DATA_ENTRIES_FOR_TESTING = {numDataEntries};
             cfg.LOADGEN_NUM_DATA_ENTRIES_DISTRIBUTION_FOR_TESTING = {1};
             cfg.LOADGEN_IO_KILOBYTES_FOR_TESTING = {ioKiloBytes};
@@ -199,6 +238,20 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
     auto nodes = simulation->getNodes();
 
     auto& app = *nodes[0]; // pick a node to generate load
+    Upgrades::UpgradeParameters scheduledUpgrades;
+    auto lclCloseTime =
+        VirtualClock::from_time_t(app.getLedgerManager()
+                                      .getLastClosedLedgerHeader()
+                                      .header.scpValue.closeTime);
+    scheduledUpgrades.mUpgradeTime = lclCloseTime;
+    scheduledUpgrades.mProtocolVersion =
+        Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    for (auto const& node : nodes)
+    {
+        node->getHerder().setUpgrades(scheduledUpgrades);
+    }
+    simulation->crankForAtLeast(std::chrono::seconds(20), false);
+
     auto& loadGen = app.getLoadGenerator();
     auto getSuccessfulTxCount = [&]() {
         return nodes[0]
@@ -218,6 +271,23 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
         [&]() { return complete.count() == completeCount + 1; },
         100 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
+    // Before creating any contracts, test that loadgen correctly
+    // reports an error when trying to run a soroban invoke setup.
+    SECTION("misconfigured soroban loadgen mode usage")
+    {
+        // Users are required to run SOROBAN_INVOKE_SETUP_LOAD before running
+        // SOROBAN_INVOKE_LOAD. Running a SOROBAN_INVOKE_LOAD without a prior
+        // SOROBAN_INVOKE_SETUP_LOAD should throw a helpful exception explaining
+        // the misconfiguration.
+        auto invokeLoadCfg =
+            GeneratedLoadConfig::txLoad(LoadGenMode::SOROBAN_INVOKE,
+                                        /* nAccounts*/ 1, /* numSorobanTxs */ 1,
+                                        /* txRate */ 1);
+        REQUIRE_THROWS_WITH(
+            loadGen.generateLoad(invokeLoadCfg),
+            "Before running MODE::SOROBAN_INVOKE, please run "
+            "MODE::SOROBAN_INVOKE_SETUP to set up your contract first.");
+    }
     int64_t numTxsBefore = getSuccessfulTxCount();
 
     // Make sure config upgrade works with initial network config settings
@@ -287,8 +357,8 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
         rand_uniform<int64_t>(INT64_MAX - 10'000, INT64_MAX);
     upgradeCfg.startingEvictionScanLevel = rand_uniform<uint32_t>(4, 8);
 
-    auto upgradeSetKey =
-        loadGen.getConfigUpgradeSetKey(createUpgradeLoadGenConfig);
+    auto upgradeSetKey = loadGen.getConfigUpgradeSetKey(
+        createUpgradeLoadGenConfig.getSorobanUpgradeConfig());
 
     numTxsBefore = getSuccessfulTxCount();
     loadGen.generateLoad(createUpgradeLoadGenConfig);
@@ -437,8 +507,8 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
                 cfg.mTxMaxSizeBytes * cfg.mLedgerMaxTxCount;
         },
         simulation);
-    auto const numInstances = 10;
-    auto const numSorobanTxs = 100;
+    auto const numInstances = nAccounts;
+    auto const numSorobanTxs = 150;
 
     numTxsBefore = getSuccessfulTxCount();
 
@@ -471,8 +541,7 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
         /* txRate */ 1);
 
     invokeLoadCfg.getMutSorobanConfig().nInstances = numInstances;
-    constexpr int maxInvokeFail = 10;
-    invokeLoadCfg.setMinSorobanPercentSuccess(100 - maxInvokeFail);
+    invokeLoadCfg.setMinSorobanPercentSuccess(100);
 
     loadGen.generateLoad(invokeLoadCfg);
     completeCount = complete.count();
@@ -487,15 +556,8 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
             {"ledger", "apply-soroban", "success"});
         auto& txsFailed = node->getMetrics().NewCounter(
             {"ledger", "apply-soroban", "failure"});
-
-        // Because we can't preflight TXs, some invocations will fail due to too
-        // few resources. This is expected, as our instruction counts are
-        // approximations. The following checks will make sure all set up
-        // phases succeeded, so only the invoke phase may have acceptable failed
-        // TXs
-        REQUIRE(txsSucceeded.count() >
-                numTxsBefore + numSorobanTxs - maxInvokeFail);
-        REQUIRE(txsFailed.count() < maxInvokeFail);
+        REQUIRE(txsSucceeded.count() == numTxsBefore + numSorobanTxs);
+        REQUIRE(txsFailed.count() == 0);
     }
 
     auto instanceKeys = loadGen.getContractInstanceKeysForTesting();
@@ -557,16 +619,7 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
         constexpr uint32_t uploadWeight = 5;
         mixCfg.sorobanUploadWeight = uploadWeight;
 
-        // Because we can't preflight TXs, some invocations will fail due to too
-        // few resources. This is expected, as our instruction counts are
-        // approximations. Additionally, many upload transactions will fail as
-        // they are likely to generate invalid wasm. Therefore, we check that
-        // all but `maxInvokeFail + 1.5 * uploadWeight` transactions succeed. In
-        // case the random sampling produces more upload transactions than
-        // expected, we allow for a 50% margin of error on the number of upload
-        // transactions.
-        constexpr int maxSorobanFail = 1.5 * uploadWeight + maxInvokeFail;
-        mixLoadCfg.setMinSorobanPercentSuccess(100 - maxSorobanFail);
+        mixLoadCfg.setMinSorobanPercentSuccess(100);
 
         loadGen.generateLoad(mixLoadCfg);
         auto numSuccessBefore = getSuccessfulTxCount();
@@ -582,53 +635,10 @@ TEST_CASE("generate soroban load", "[loadgen][soroban]")
         // Check results
         for (auto node : nodes)
         {
-            auto& totalSucceeded =
-                node->getMetrics().NewCounter({"ledger", "apply", "success"});
             auto& totalFailed =
                 node->getMetrics().NewCounter({"ledger", "apply", "failure"});
-            auto& sorobanSucceeded = node->getMetrics().NewCounter(
-                {"ledger", "apply-soroban", "success"});
-            auto& sorobanFailed = node->getMetrics().NewCounter(
-                {"ledger", "apply-soroban", "failure"});
-
-            // Total number of classic transactions
-            int64_t classicTotal =
-                totalSucceeded.count() + totalFailed.count() -
-                sorobanSucceeded.count() - sorobanFailed.count();
-
-            // All classic transaction should succeed
-            REQUIRE(totalSucceeded.count() - sorobanSucceeded.count() ==
-                    classicTotal);
-            // All failures should be soroban failures)
-            REQUIRE(totalFailed.count() == sorobanFailed.count());
-
-            // Check soroban results
-            REQUIRE(sorobanSucceeded.count() > numSuccessBefore + numMixedTxs -
-                                                   classicTotal -
-                                                   maxSorobanFail);
-            REQUIRE(sorobanFailed.count() <= maxSorobanFail + numFailedBefore);
+            REQUIRE(totalFailed.count() == 0);
         }
-    }
-
-    // Test minimum percent success with too many transactions that fail to
-    // apply by requiring a 100% success rate for SOROBAN_UPLOAD mode
-    SECTION("Too many failed transactions")
-    {
-        auto uploadFailCfg = GeneratedLoadConfig::txLoad(
-            LoadGenMode::SOROBAN_UPLOAD, nAccounts, numSorobanTxs,
-            /* txRate */ 1);
-
-        // Set success percentage to 100% and leave other parameters at default.
-        uploadFailCfg.setMinSorobanPercentSuccess(100);
-
-        // LoadGen should fail
-        loadGen.generateLoad(uploadFailCfg);
-        auto& fail =
-            app.getMetrics().NewMeter({"loadgen", "run", "failed"}, "run");
-        auto failCount = fail.count();
-        simulation->crankUntil([&]() { return fail.count() == failCount + 1; },
-                               300 * Herder::EXP_LEDGER_TIMESPAN_SECONDS,
-                               false);
     }
 }
 
@@ -819,4 +829,125 @@ TEST_CASE("Upgrade setup with metrics reset", "[loadgen]")
     sim->crankUntil([&]() { return runsComplete.count() == 1; },
                     5 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
     REQUIRE(runsFailed.count() == 0);
+}
+
+TEST_CASE("apply load", "[loadgen][applyload]")
+{
+    auto cfg = getTestConfig();
+    cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 1000;
+    cfg.USE_CONFIG_FOR_GENESIS = true;
+    cfg.LEDGER_PROTOCOL_VERSION = Config::CURRENT_LEDGER_PROTOCOL_VERSION;
+    cfg.MANUAL_CLOSE = true;
+
+    cfg.APPLY_LOAD_DATA_ENTRY_SIZE_FOR_TESTING = 1000;
+
+    cfg.APPLY_LOAD_BL_SIMULATED_LEDGERS = 10000;
+    cfg.APPLY_LOAD_BL_WRITE_FREQUENCY = 1000;
+    cfg.APPLY_LOAD_BL_BATCH_SIZE = 1000;
+    cfg.APPLY_LOAD_BL_LAST_BATCH_LEDGERS = 300;
+    cfg.APPLY_LOAD_BL_LAST_BATCH_SIZE = 100;
+
+    cfg.APPLY_LOAD_NUM_RO_ENTRIES_FOR_TESTING = {5, 10, 30};
+    cfg.APPLY_LOAD_NUM_RO_ENTRIES_DISTRIBUTION_FOR_TESTING = {1, 1, 1};
+
+    cfg.APPLY_LOAD_NUM_RW_ENTRIES_FOR_TESTING = {1, 5, 10};
+    cfg.APPLY_LOAD_NUM_RW_ENTRIES_DISTRIBUTION_FOR_TESTING = {1, 1, 1};
+
+    cfg.APPLY_LOAD_EVENT_COUNT_FOR_TESTING = {100};
+    cfg.APPLY_LOAD_EVENT_COUNT_DISTRIBUTION_FOR_TESTING = {1};
+
+    cfg.LOADGEN_TX_SIZE_BYTES_FOR_TESTING = {1'000, 2'000, 5'000};
+    cfg.LOADGEN_TX_SIZE_BYTES_DISTRIBUTION_FOR_TESTING = {3, 2, 1};
+
+    cfg.LOADGEN_INSTRUCTIONS_FOR_TESTING = {10'000'000, 50'000'000};
+    cfg.LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING = {5, 1};
+
+    cfg.APPLY_LOAD_LEDGER_MAX_INSTRUCTIONS = 500'000'000;
+    cfg.APPLY_LOAD_TX_MAX_INSTRUCTIONS = 100'000'000;
+
+    cfg.APPLY_LOAD_LEDGER_MAX_READ_LEDGER_ENTRIES = 2000;
+    cfg.APPLY_LOAD_TX_MAX_READ_LEDGER_ENTRIES = 100;
+
+    cfg.APPLY_LOAD_LEDGER_MAX_READ_BYTES = 50'000'000;
+    cfg.APPLY_LOAD_TX_MAX_READ_BYTES = 200'000;
+
+    cfg.APPLY_LOAD_LEDGER_MAX_WRITE_LEDGER_ENTRIES = 1250;
+    cfg.APPLY_LOAD_TX_MAX_WRITE_LEDGER_ENTRIES = 50;
+
+    cfg.APPLY_LOAD_LEDGER_MAX_WRITE_BYTES = 700'000;
+    cfg.APPLY_LOAD_TX_MAX_WRITE_BYTES = 66560;
+
+    cfg.APPLY_LOAD_MAX_TX_SIZE_BYTES = 71680;
+    cfg.APPLY_LOAD_MAX_LEDGER_TX_SIZE_BYTES = 800'000;
+
+    cfg.APPLY_LOAD_MAX_CONTRACT_EVENT_SIZE_BYTES = 8198;
+    cfg.APPLY_LOAD_MAX_TX_COUNT = 50;
+
+    VirtualClock clock(VirtualClock::REAL_TIME);
+    auto app = createTestApplication(clock, cfg);
+
+    ApplyLoad al(*app);
+
+    auto& ledgerClose =
+        app->getMetrics().NewTimer({"ledger", "ledger", "close"});
+    ledgerClose.Clear();
+
+    auto& cpuInsRatio = app->getMetrics().NewHistogram(
+        {"soroban", "host-fn-op", "invoke-time-fsecs-cpu-insn-ratio"});
+    cpuInsRatio.Clear();
+
+    auto& cpuInsRatioExclVm = app->getMetrics().NewHistogram(
+        {"soroban", "host-fn-op", "invoke-time-fsecs-cpu-insn-ratio-excl-vm"});
+    cpuInsRatioExclVm.Clear();
+
+    auto& declaredInsnsUsageRatio = app->getMetrics().NewHistogram(
+        {"soroban", "host-fn-op", "declared-cpu-insns-usage-ratio"});
+    declaredInsnsUsageRatio.Clear();
+
+    for (size_t i = 0; i < 100; ++i)
+    {
+        app->getBucketManager().getLiveBucketList().resolveAllFutures();
+        releaseAssert(
+            app->getBucketManager().getLiveBucketList().futuresAllResolved());
+
+        al.benchmark();
+    }
+    REQUIRE(1.0 - al.successRate() < std::numeric_limits<double>::epsilon());
+    CLOG_INFO(Perf, "Max ledger close: {} milliseconds", ledgerClose.max());
+    CLOG_INFO(Perf, "Min ledger close: {} milliseconds", ledgerClose.min());
+    CLOG_INFO(Perf, "Mean ledger close:  {} milliseconds", ledgerClose.mean());
+    CLOG_INFO(Perf, "stddev ledger close:  {} milliseconds",
+              ledgerClose.std_dev());
+
+    CLOG_INFO(Perf, "Max CPU ins ratio: {}", cpuInsRatio.max() / 1000000);
+    CLOG_INFO(Perf, "Mean CPU ins ratio:  {}", cpuInsRatio.mean() / 1000000);
+
+    CLOG_INFO(Perf, "Max CPU ins ratio excl VM: {}",
+              cpuInsRatioExclVm.max() / 1000000);
+    CLOG_INFO(Perf, "Mean CPU ins ratio excl VM:  {}",
+              cpuInsRatioExclVm.mean() / 1000000);
+    CLOG_INFO(Perf, "stddev CPU ins ratio excl VM:  {}",
+              cpuInsRatioExclVm.std_dev() / 1000000);
+
+    CLOG_INFO(Perf, "Min CPU declared insns ratio: {}",
+              declaredInsnsUsageRatio.min() / 1000000.0);
+    CLOG_INFO(Perf, "Mean CPU declared insns ratio:  {}",
+              declaredInsnsUsageRatio.mean() / 1000000.0);
+    CLOG_INFO(Perf, "stddev CPU declared insns ratio:  {}",
+              declaredInsnsUsageRatio.std_dev() / 1000000.0);
+
+    CLOG_INFO(Perf, "Tx count utilization {}%",
+              al.getTxCountUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Instruction utilization {}%",
+              al.getInstructionUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Tx size utilization {}%",
+              al.getTxSizeUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Read bytes utilization {}%",
+              al.getReadByteUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Write bytes utilization {}%",
+              al.getWriteByteUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Read entry utilization {}%",
+              al.getReadEntryUtilization().mean() / 1000.0);
+    CLOG_INFO(Perf, "Write entry utilization {}%",
+              al.getWriteEntryUtilization().mean() / 1000.0);
 }

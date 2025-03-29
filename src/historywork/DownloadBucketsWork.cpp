@@ -4,7 +4,7 @@
 
 #include "historywork/DownloadBucketsWork.h"
 #include "bucket/BucketManager.h"
-#include "catchup/CatchupManager.h"
+#include "catchup/LedgerApplyManager.h"
 #include "history/FileTransferInfo.h"
 #include "history/HistoryArchive.h"
 #include "historywork/GetAndUnzipRemoteFileWork.h"
@@ -12,12 +12,14 @@
 #include "work/WorkWithCallback.h"
 #include <Tracy.hpp>
 #include <fmt/format.h>
+#include <mutex>
 
 namespace stellar
 {
 
 DownloadBucketsWork::DownloadBucketsWork(
-    Application& app, std::map<std::string, std::shared_ptr<Bucket>>& buckets,
+    Application& app,
+    std::map<std::string, std::shared_ptr<LiveBucket>>& buckets,
     std::vector<std::string> hashes, TmpDir const& downloadDir,
     std::shared_ptr<HistoryArchive> archive)
     : BatchWork{app, "download-verify-buckets"}
@@ -71,7 +73,7 @@ DownloadBucketsWork::yieldMoreWork()
     }
 
     auto hash = *mNextBucketIter;
-    FileTransferInfo ft(mDownloadDir, HISTORY_FILE_TYPE_BUCKET, hash);
+    FileTransferInfo ft(mDownloadDir, FileType::HISTORY_FILE_TYPE_BUCKET, hash);
     auto w1 = std::make_shared<GetAndUnzipRemoteFileWork>(mApp, ft, mArchive);
 
     auto getFileWeak = std::weak_ptr<GetAndUnzipRemoteFileWork>(w1);
@@ -89,21 +91,42 @@ DownloadBucketsWork::yieldMoreWork()
     };
     std::weak_ptr<DownloadBucketsWork> weak(
         std::static_pointer_cast<DownloadBucketsWork>(shared_from_this()));
-    auto successCb = [weak, ft, hash](Application& app) -> bool {
+
+    auto currId = mIndexId++;
+    mIndexMapMutex.lock();
+    auto [indexIter, inserted] = mIndexMap.emplace(currId, nullptr);
+    mIndexMapMutex.unlock();
+    releaseAssertOrThrow(inserted);
+
+    auto successCb = [weak, ft, hash, currId](Application& app) -> bool {
         auto self = weak.lock();
         if (self)
         {
+            // To avoid dangling references, maintain a map of index pointers
+            // and do a lookup inside the callback instead of capturing anything
+            // by reference.
+            std::unique_ptr<LiveBucketIndex const> index{};
+            {
+                std::lock_guard<std::mutex> lock(self->mIndexMapMutex);
+                auto indexIter = self->mIndexMap.find(currId);
+                releaseAssertOrThrow(indexIter != self->mIndexMap.end());
+                releaseAssertOrThrow(indexIter->second);
+                index = std::move(indexIter->second);
+                self->mIndexMap.erase(indexIter);
+            }
+
             auto bucketPath = ft.localPath_nogz();
-            auto b = app.getBucketManager().adoptFileAsBucket(
+            auto b = app.getBucketManager().adoptFileAsBucket<LiveBucket>(
                 bucketPath, hexToBin256(hash),
                 /*mergeKey=*/nullptr,
-                /*index=*/nullptr);
+                /*index=*/std::move(index));
             self->mBuckets[hash] = b;
         }
         return true;
     };
     auto w2 = std::make_shared<VerifyBucketWork>(mApp, ft.localPath_nogz(),
-                                                 hexToBin256(hash), failureCb);
+                                                 hexToBin256(hash),
+                                                 indexIter->second, failureCb);
     auto w3 = std::make_shared<WorkWithCallback>(mApp, "adopt-verified-bucket",
                                                  successCb);
     std::vector<std::shared_ptr<BasicWork>> seq{w1, w2, w3};

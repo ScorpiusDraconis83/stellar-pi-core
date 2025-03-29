@@ -12,16 +12,27 @@ namespace stellar
 namespace testtxset
 {
 
-using ComponentPhases = std::vector<
+using PhaseComponents = std::vector<
     std::pair<std::optional<int64_t>, std::vector<TransactionFrameBasePtr>>>;
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
 makeNonValidatedGeneralizedTxSet(
-    std::vector<ComponentPhases> const& txsPerBaseFee, Application& app,
-    Hash const& previousLedgerHash);
+    std::vector<PhaseComponents> const& txsPerBaseFee, Application& app,
+    Hash const& previousLedgerHash,
+    std::optional<bool> useParallelSorobanPhase = std::nullopt);
 
 std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
 makeNonValidatedTxSetBasedOnLedgerVersion(
-    uint32_t ledgerVersion, std::vector<TransactionFrameBasePtr> const& txs,
-    Application& app, Hash const& previousLedgerHash);
+    std::vector<TransactionFrameBasePtr> const& txs, Application& app,
+    Hash const& previousLedgerHash);
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+void normalizeParallelPhaseXDR(TransactionPhase& phase);
+
+std::pair<TxSetXDRFrameConstPtr, ApplicableTxSetFrameConstPtr>
+makeNonValidatedGeneralizedTxSet(PhaseComponents const& classicTxsPerBaseFee,
+                                 std::optional<int64_t> sorobanBaseFee,
+                                 TxStageFrameList const& sorobanTxsPerStage,
+                                 Application& app,
+                                 Hash const& previousLedgerHash);
+#endif
 } // namespace testtxset
 } // namespace stellar

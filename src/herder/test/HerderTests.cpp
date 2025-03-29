@@ -8,6 +8,7 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "scp/SCP.h"
+#include "scp/Slot.h"
 #include "simulation/Simulation.h"
 #include "simulation/Topologies.h"
 #include "test/TestAccount.h"
@@ -16,7 +17,7 @@
 
 #include "history/test/HistoryTestsUtils.h"
 
-#include "catchup/CatchupManagerImpl.h"
+#include "catchup/LedgerApplyManagerImpl.h"
 #include "crypto/SHA.h"
 #include "database/Database.h"
 #include "herder/HerderUtils.h"
@@ -45,6 +46,7 @@
 #include "xdrpp/autocheck.h"
 #include "xdrpp/marshal.h"
 #include <algorithm>
+#include <cmath>
 #include <fmt/format.h>
 #include <memory>
 #include <numeric>
@@ -95,22 +97,9 @@ TEST_CASE_VERSIONS("standalone", "[herder][acceptance]")
             };
 
             auto waitForExternalize = [&]() {
-                bool stop = false;
                 auto prev = app->getLedgerManager().getLastClosedLedgerNum();
-                VirtualTimer checkTimer(*app);
-
-                auto check = [&](asio::error_code const& error) {
-                    REQUIRE(!error);
-                    REQUIRE(app->getLedgerManager().getLastClosedLedgerNum() >
-                            prev);
-                    stop = true;
-                };
-
-                checkTimer.expires_from_now(
-                    Herder::EXP_LEDGER_TIMESPAN_SECONDS +
-                    std::chrono::seconds(1));
-                checkTimer.async_wait(check);
-                while (!stop)
+                while (app->getLedgerManager().getLastClosedLedgerNum() <=
+                       prev + 1)
                 {
                     app->getClock().crank(true);
                 }
@@ -210,54 +199,6 @@ TEST_CASE_VERSIONS("standalone", "[herder][acceptance]")
                     REQUIRE(c1.loadSequenceNumber() == expectedC1Seq);
                 }
             }
-
-            SECTION("Queue processing test")
-            {
-                app->getCommandHandler().manualCmd("maintenance?queue=true");
-
-                while (app->getLedgerManager().getLastClosedLedgerNum() <
-                       (app->getHistoryManager().getCheckpointFrequency() + 5))
-                {
-                    app->getClock().crank(true);
-                }
-
-                app->getCommandHandler().manualCmd("setcursor?id=A1&cursor=1");
-                app->getCommandHandler().manualCmd("maintenance?queue=true");
-                auto& db = app->getDatabase();
-                auto& sess = db.getSession();
-
-                app->getCommandHandler().manualCmd("setcursor?id=A2&cursor=3");
-                app->getCommandHandler().manualCmd("maintenance?queue=true");
-                auto lh = LedgerHeaderUtils::loadBySequence(db, sess, 2);
-                REQUIRE(!!lh);
-
-                app->getCommandHandler().manualCmd("setcursor?id=A1&cursor=2");
-                // this should delete items older than sequence 2
-                app->getCommandHandler().manualCmd("maintenance?queue=true");
-                lh = LedgerHeaderUtils::loadBySequence(db, sess, 2);
-                REQUIRE(!lh);
-                lh = LedgerHeaderUtils::loadBySequence(db, sess, 3);
-                REQUIRE(!!lh);
-
-                // this should delete items older than sequence 3
-                SECTION("set min to 3 by update")
-                {
-                    app->getCommandHandler().manualCmd(
-                        "setcursor?id=A1&cursor=3");
-                    app->getCommandHandler().manualCmd(
-                        "maintenance?queue=true");
-                    lh = LedgerHeaderUtils::loadBySequence(db, sess, 3);
-                    REQUIRE(!lh);
-                }
-                SECTION("set min to 3 by deletion")
-                {
-                    app->getCommandHandler().manualCmd("dropcursor?id=A1");
-                    app->getCommandHandler().manualCmd(
-                        "maintenance?queue=true");
-                    lh = LedgerHeaderUtils::loadBySequence(db, sess, 3);
-                    REQUIRE(!lh);
-                }
-            }
         }
     });
 }
@@ -350,7 +291,7 @@ testTxSet(uint32 protocolVersion)
         {
             auto newUser = TestAccount{*app, getAccount("doesnotexist")};
             txs.push_back(newUser.tx({payment(root, 1)}));
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions(txs, *app, 0, 0, removed).second;
             REQUIRE(removed.size() == 1);
@@ -362,7 +303,7 @@ testTxSet(uint32 protocolVersion)
             setSeqNum(std::static_pointer_cast<TransactionTestFrame>(txPtr),
                       txs[0]->getSeqNum() + 5);
 
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions(txs, *app, 0, 0, removed).second;
             REQUIRE(removed.size() == 1);
@@ -374,7 +315,7 @@ testTxSet(uint32 protocolVersion)
             txs.back() = accounts.back().tx(
                 {payment(accounts.back().getPublicKey(), 10000)});
 
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions(txs, *app, 0, 0, removed).second;
             REQUIRE(removed.size() == 1);
@@ -386,7 +327,7 @@ testTxSet(uint32 protocolVersion)
                 std::static_pointer_cast<TransactionTestFrame const>(txs[0]);
             setMaxTime(tx, UINT64_MAX);
             tx->clearCached();
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions(txs, *app, 0, 0, removed).second;
             REQUIRE(removed.size() == 1);
@@ -420,8 +361,8 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
     auto account2 = root.create("a2", minBalance2);
     auto account3 = root.create("a3", minBalance2);
 
-    auto compareTxs = [](TxSetTransactions const& actual,
-                         TxSetTransactions const& expected) {
+    auto compareTxs = [](TxFrameList const& actual,
+                         TxFrameList const& expected) {
         auto actualNormalized = actual;
         auto expectedNormalized = expected;
         std::sort(actualNormalized.begin(), actualNormalized.end());
@@ -435,7 +376,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
         {
             auto tx1 = transaction(*app, account1, 1, 1, 100);
             auto fb1 = feeBump(*app, account2, tx1, minBalance2);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb1});
@@ -447,7 +388,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto fb1 = feeBump(*app, account2, tx1, minBalance2);
             auto tx2 = transaction(*app, account1, 2, 1, 100);
             auto fb2 = feeBump(*app, account2, tx2, 200);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb1, fb2});
@@ -461,7 +402,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto fb1 = feeBump(*app, account2, tx1, 200);
             auto tx2 = transaction(*app, account1, 2, 1, 100);
             auto fb2 = feeBump(*app, account2, tx2, minBalance2);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb2});
@@ -477,7 +418,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto tx2 = transaction(*app, account1, 2, -1, 100);
             auto fb2 =
                 feeBump(*app, account2, tx2, minBalance2 - minBalance0 - 199);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb2});
@@ -490,7 +431,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto fb1 = feeBump(*app, account2, tx1, 200);
             auto tx2 = transaction(*app, account2, 1, 1, 100);
             auto fb2 = feeBump(*app, account2, tx2, minBalance2);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb2});
@@ -504,7 +445,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto tx2 = transaction(*app, account2, 1, -1, 100);
             auto fb2 =
                 feeBump(*app, account2, tx2, minBalance2 - minBalance0 - 199);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({fb1, fb2}, *app, 0, 0, invalidTxs);
             compareTxs(invalidTxs, {fb2});
@@ -520,7 +461,7 @@ testTxSetWithFeeBumps(uint32 protocolVersion)
             auto tx3 = transaction(*app, account1, 3, 1, 100);
             auto fb3 =
                 feeBump(*app, account2, tx3, minBalance2 - minBalance0 - 199);
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet = makeTxSetFromTransactions({fb1, fb2, fb3}, *app, 0, 0,
                                                    invalidTxs);
             compareTxs(invalidTxs, {fb2, fb3});
@@ -586,7 +527,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
 
             auto txInvalid = transactionWithV2Precondition(
                 *app, a1, 1, 100, minSeqAgeCond(minGap + 1));
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions({txInvalid}, *app, 0, 0, removed)
                     .second;
@@ -656,7 +597,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
         {
             auto txInvalid = transactionWithV2Precondition(
                 *app, a2, 1, 100, ledgerBoundsCond(lclNum + 2, 0));
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet = makeTxSetFromTransactions({tx1, txInvalid}, *app, 0, 0,
                                                    removed);
             REQUIRE(removed.back() == txInvalid);
@@ -673,7 +614,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
         {
             auto txInvalid = transactionWithV2Precondition(
                 *app, a2, 1, 100, ledgerBoundsCond(0, lclNum));
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet = makeTxSetFromTransactions({tx1, txInvalid}, *app, 0, 0,
                                                    removed);
             REQUIRE(removed.back() == txInvalid);
@@ -702,14 +643,14 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
             SECTION("success")
             {
                 tx->addSignature(root.getSecretKey());
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.empty());
             }
             SECTION("fail")
             {
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.back() == tx);
@@ -728,14 +669,14 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
             SECTION("success")
             {
                 tx->addSignature(a2.getSecretKey());
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.empty());
             }
             SECTION("fail")
             {
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.back() == tx);
@@ -747,7 +688,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
             auto txDupeSigner =
                 transactionWithV2Precondition(*app, a1, 1, 100, cond);
             txDupeSigner->addSignature(root.getSecretKey());
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions({txDupeSigner}, *app, 0, 0, removed);
             REQUIRE(removed.back() == txDupeSigner);
@@ -757,7 +698,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
         {
             auto rootTx =
                 transactionWithV2Precondition(*app, root, 1, 100, cond);
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet =
                 makeTxSetFromTransactions({rootTx}, *app, 0, 0, removed);
             REQUIRE(removed.empty());
@@ -772,14 +713,14 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
             {
                 tx->addSignature(root.getSecretKey());
 
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.empty());
             }
             SECTION("signature missing")
             {
-                TxSetTransactions removed;
+                TxFrameList removed;
                 auto txSet =
                     makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
                 REQUIRE(removed.back() == tx);
@@ -795,7 +736,7 @@ TEST_CASE("txset with PreconditionsV2", "[herder][txset]")
                                               {root.op(payment(a1, 1))}, {root},
                                               cond);
 
-            TxSetTransactions removed;
+            TxFrameList removed;
             auto txSet = makeTxSetFromTransactions({tx}, *app, 0, 0, removed);
             REQUIRE(removed.empty());
         }
@@ -1053,7 +994,8 @@ TEST_CASE("tx set hits overlay byte limit during construction",
         cfg.mLedgerMaxInstructions = max;
     });
 
-    auto const& conf = app->getLedgerManager().getSorobanNetworkConfig();
+    auto const& conf =
+        app->getLedgerManager().getLastClosedSorobanNetworkConfig();
     uint32_t maxContractSize = 0;
     maxContractSize = conf.maxContractSizeBytes();
 
@@ -1076,7 +1018,7 @@ TEST_CASE("tx set hits overlay byte limit during construction",
     };
 
     auto testPhaseWithOverlayLimit = [&](TxSetPhase const& phase) {
-        TxSetTransactions txs;
+        TxFrameList txs;
         size_t totalSize = 0;
         int txCount = 0;
 
@@ -1087,17 +1029,17 @@ TEST_CASE("tx set hits overlay byte limit during construction",
             totalSize += xdr::xdr_size(txs.back()->getEnvelope());
         }
 
-        TxSetPhaseTransactions invalidPhases;
+        PerPhaseTransactionList invalidPhases;
         invalidPhases.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
 
-        TxSetPhaseTransactions phases;
+        PerPhaseTransactionList phases;
         if (phase == TxSetPhase::SOROBAN)
         {
-            phases = TxSetPhaseTransactions{{}, txs};
+            phases = PerPhaseTransactionList{{}, txs};
         }
         else
         {
-            phases = TxSetPhaseTransactions{txs, {}};
+            phases = PerPhaseTransactionList{txs, {}};
         }
 
         auto [txSet, applicableTxSet] =
@@ -1105,7 +1047,7 @@ TEST_CASE("tx set hits overlay byte limit during construction",
         REQUIRE(txSet->encodedSize() <= MAX_MESSAGE_SIZE);
 
         REQUIRE(invalidPhases[static_cast<size_t>(phase)].empty());
-        auto const& phaseTxs = applicableTxSet->getTxsForPhase(phase);
+        auto const& phaseTxs = applicableTxSet->getPhase(phase);
         auto trimmedSize =
             std::accumulate(phaseTxs.begin(), phaseTxs.end(), size_t(0),
                             [&](size_t a, TransactionFrameBasePtr const& tx) {
@@ -1133,7 +1075,7 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
 {
     SECTION("max 0 ops per ledger")
     {
-        Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS));
+        Config cfg(getTestConfig(0, Config::TESTDB_IN_MEMORY));
         cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 0;
 
         VirtualClock clock;
@@ -1146,7 +1088,7 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         {
             auto tx = makeMultiPayment(destAccount, root, 1, 100, 0, 1);
 
-            TxSetTransactions invalidTxs;
+            TxFrameList invalidTxs;
             auto txSet =
                 makeTxSetFromTransactions({tx}, *app, 0, 0, invalidTxs).second;
 
@@ -1164,10 +1106,10 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
             auto sorobanTx = createUploadWasmTx(
                 *app, root, baseFee, DEFAULT_TEST_RESOURCE_FEE, resources);
 
-            TxSetPhaseTransactions invalidTxs;
+            PerPhaseTransactionList invalidTxs;
             invalidTxs.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
             auto txSet = makeTxSetFromTransactions(
-                             TxSetPhaseTransactions{{}, {sorobanTx}}, *app, 0,
+                             PerPhaseTransactionList{{}, {sorobanTx}}, *app, 0,
                              0, invalidTxs)
                              .second;
 
@@ -1208,7 +1150,7 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         auto tx = makeMultiPayment(acc1, root, 1, 100, 0, 1);
 
         SorobanNetworkConfig conf =
-            app->getLedgerManager().getSorobanNetworkConfig();
+            app->getLedgerManager().getLastClosedSorobanNetworkConfig();
 
         uint32_t const baseFee = 10'000'000;
         SorobanResources resources;
@@ -1220,7 +1162,7 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
 
         auto generateTxs = [&](std::vector<TestAccount>& accounts,
                                SorobanNetworkConfig conf) {
-            TxSetTransactions txs;
+            TxFrameList txs;
             for (auto& acc : accounts)
             {
                 SorobanResources res;
@@ -1285,10 +1227,10 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
                 invalidSoroban = createUploadWasmTx(
                     *app, acc2, baseFee, DEFAULT_TEST_RESOURCE_FEE, resources);
             }
-            TxSetPhaseTransactions invalidPhases;
+            PerPhaseTransactionList invalidPhases;
             invalidPhases.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
             auto txSet = makeTxSetFromTransactions(
-                             TxSetPhaseTransactions{{tx}, {invalidSoroban}},
+                             PerPhaseTransactionList{{tx}, {invalidSoroban}},
                              *app, 0, 0, invalidPhases)
                              .second;
 
@@ -1301,11 +1243,11 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         }
         SECTION("classic and soroban fit")
         {
-            TxSetPhaseTransactions invalidPhases;
+            PerPhaseTransactionList invalidPhases;
             invalidPhases.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
             auto txSet = makeTxSetFromTransactions(
-                             TxSetPhaseTransactions{{tx}, {sorobanTx}}, *app, 0,
-                             0, invalidPhases)
+                             PerPhaseTransactionList{{tx}, {sorobanTx}}, *app,
+                             0, 0, invalidPhases)
                              .second;
 
             // Everything fits
@@ -1315,11 +1257,11 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         }
         SECTION("classic and soroban in the same phase are rejected")
         {
-            TxSetPhaseTransactions invalidPhases;
+            PerPhaseTransactionList invalidPhases;
             invalidPhases.resize(1);
             REQUIRE_THROWS_AS(makeTxSetFromTransactions(
-                                  TxSetPhaseTransactions{{tx, sorobanTx}}, *app,
-                                  0, 0, invalidPhases),
+                                  PerPhaseTransactionList{{tx, sorobanTx}},
+                                  *app, 0, 0, invalidPhases),
                               std::runtime_error);
         }
         SECTION("soroban surge pricing, classic unaffected")
@@ -1327,21 +1269,23 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
             // Another soroban tx with higher fee, which will be selected
             auto sorobanTxHighFee = createUploadWasmTx(
                 *app, acc3, baseFee * 2, DEFAULT_TEST_RESOURCE_FEE, resources);
-            TxSetPhaseTransactions invalidPhases;
+            PerPhaseTransactionList invalidPhases;
             invalidPhases.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
-            auto txSet =
-                makeTxSetFromTransactions(
-                    TxSetPhaseTransactions{{tx}, {sorobanTx, sorobanTxHighFee}},
-                    *app, 0, 0, invalidPhases)
-                    .second;
+            auto txSet = makeTxSetFromTransactions(
+                             PerPhaseTransactionList{
+                                 {tx}, {sorobanTx, sorobanTxHighFee}},
+                             *app, 0, 0, invalidPhases)
+                             .second;
 
             REQUIRE(std::all_of(invalidPhases.begin(), invalidPhases.end(),
                                 [](auto const& txs) { return txs.empty(); }));
             REQUIRE(txSet->sizeTxTotal() == 2);
-            auto const& classicTxs = txSet->getTxsForPhase(TxSetPhase::CLASSIC);
+            auto const& classicTxs =
+                txSet->getPhase(TxSetPhase::CLASSIC).getSequentialTxs();
             REQUIRE(classicTxs.size() == 1);
             REQUIRE(classicTxs[0]->getFullHash() == tx->getFullHash());
-            auto const& sorobanTxs = txSet->getTxsForPhase(TxSetPhase::SOROBAN);
+            auto const& sorobanTxs =
+                txSet->getPhase(TxSetPhase::SOROBAN).getSequentialTxs();
             REQUIRE(sorobanTxs.size() == 1);
             REQUIRE(sorobanTxs[0]->getFullHash() ==
                     sorobanTxHighFee->getFullHash());
@@ -1363,11 +1307,11 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
             auto smallSorobanLowFee = createUploadWasmTx(
                 *app, acc4, baseFee / 10, DEFAULT_TEST_RESOURCE_FEE, resources);
 
-            TxSetPhaseTransactions invalidPhases;
+            PerPhaseTransactionList invalidPhases;
             invalidPhases.resize(static_cast<size_t>(TxSetPhase::PHASE_COUNT));
             auto txSet =
                 makeTxSetFromTransactions(
-                    TxSetPhaseTransactions{
+                    PerPhaseTransactionList{
                         {tx},
                         {sorobanTxHighFee, smallSorobanLowFee, sorobanTx}},
                     *app, 0, 0, invalidPhases)
@@ -1376,10 +1320,11 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
             REQUIRE(std::all_of(invalidPhases.begin(), invalidPhases.end(),
                                 [](auto const& txs) { return txs.empty(); }));
             REQUIRE(txSet->sizeTxTotal() == 3);
-            auto const& classicTxs = txSet->getTxsForPhase(TxSetPhase::CLASSIC);
+            auto const& classicTxs =
+                txSet->getPhase(TxSetPhase::CLASSIC).getSequentialTxs();
             REQUIRE(classicTxs.size() == 1);
             REQUIRE(classicTxs[0]->getFullHash() == tx->getFullHash());
-            for (auto const& t : txSet->getTxsForPhase(TxSetPhase::SOROBAN))
+            for (auto const& t : txSet->getPhase(TxSetPhase::SOROBAN))
             {
                 // smallSorobanLowFee was picked over sorobanTx to fill the gap
                 bool pickedGap =
@@ -1395,11 +1340,11 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
             {
                 SECTION("iteration " + std::to_string(i))
                 {
-                    TxSetPhaseTransactions invalidPhases;
+                    PerPhaseTransactionList invalidPhases;
                     invalidPhases.resize(
                         static_cast<size_t>(TxSetPhase::PHASE_COUNT));
                     auto txSet = makeTxSetFromTransactions(
-                                     TxSetPhaseTransactions{
+                                     PerPhaseTransactionList{
                                          {tx}, generateTxs(accounts, conf)},
                                      *app, 0, 0, invalidPhases)
                                      .second;
@@ -1408,9 +1353,9 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
                         invalidPhases.begin(), invalidPhases.end(),
                         [](auto const& txs) { return txs.empty(); }));
                     auto const& classicTxs =
-                        txSet->getTxsForPhase(TxSetPhase::CLASSIC);
+                        txSet->getPhase(TxSetPhase::CLASSIC).getSequentialTxs();
                     auto const& sorobanTxs =
-                        txSet->getTxsForPhase(TxSetPhase::SOROBAN);
+                        txSet->getPhase(TxSetPhase::SOROBAN).getSequentialTxs();
                     REQUIRE(classicTxs.size() == 1);
                     REQUIRE(classicTxs[0]->getFullHash() == tx->getFullHash());
                     // Depending on resources generated for each tx, can only
@@ -1423,7 +1368,7 @@ TEST_CASE("surge pricing", "[herder][txset][soroban]")
         }
         SECTION("tx sets over limits are invalid")
         {
-            TxSetTransactions txs = generateTxs(accounts, conf);
+            TxFrameList txs = generateTxs(accounts, conf);
             auto txSet =
                 testtxset::makeNonValidatedGeneralizedTxSet(
                     {{}, {std::make_pair(500, txs)}}, *app,
@@ -1451,12 +1396,6 @@ TEST_CASE("surge pricing with DEX separation", "[herder][txset]")
     VirtualClock clock;
     Application::pointer app = createTestApplication(clock, cfg);
 
-    LedgerHeader lhCopy;
-    {
-        LedgerTxn ltx(app->getLedgerTxnRoot());
-        lhCopy = ltx.loadHeader().current();
-    }
-
     auto root = TestAccount::createRoot(*app);
 
     auto accountA = root.create("accountA", 5000000000);
@@ -1476,8 +1415,9 @@ TEST_CASE("surge pricing with DEX separation", "[herder][txset]")
                        int64_t expectedDexBaseFee) {
         auto txSet = makeTxSetFromTransactions(txs, *app, 0, 0).second;
         size_t cntA = 0, cntB = 0, cntC = 0, cntD = 0;
-        auto resTxs = txSet->getTxsInApplyOrder();
-        for (auto const& tx : resTxs)
+        auto const& phases = txSet->getPhasesInApplyOrder();
+
+        for (auto const& tx : phases[static_cast<size_t>(TxSetPhase::CLASSIC)])
         {
             if (tx->getSourceID() == accountA.getPublicKey())
             {
@@ -1504,7 +1444,7 @@ TEST_CASE("surge pricing with DEX separation", "[herder][txset]")
                 REQUIRE(seqNumD == tx->getSeqNum());
             }
 
-            auto baseFee = txSet->getTxBaseFee(tx, lhCopy);
+            auto baseFee = txSet->getTxBaseFee(tx);
             REQUIRE(baseFee);
             if (tx->hasDexOperations())
             {
@@ -1515,6 +1455,7 @@ TEST_CASE("surge pricing with DEX separation", "[herder][txset]")
                 REQUIRE(*baseFee == expectedNonDexBaseFee);
             }
         }
+
         REQUIRE(cntA == expectedTxsA);
         REQUIRE(cntB == expectedTxsB);
         REQUIRE(cntC == expectedTxsC);
@@ -1684,19 +1625,21 @@ TEST_CASE("surge pricing with DEX separation holds invariants",
             auto txs = genTxs(txCountDistr(Catch::rng()));
             auto txSet = makeTxSetFromTransactions(txs, *app, 0, 0).second;
 
-            auto resTxs = txSet->getTxsInApplyOrder();
+            auto const& phases = txSet->getPhasesInApplyOrder();
             std::array<uint32_t, 2> opsCounts{};
             std::array<int64_t, 2> baseFees{};
-            for (auto const& resTx : resTxs)
+
+            for (auto const& resTx :
+                 phases[static_cast<size_t>(TxSetPhase::CLASSIC)])
             {
                 auto isDex = static_cast<size_t>(resTx->hasDexOperations());
                 opsCounts[isDex] += resTx->getNumOperations();
-                auto baseFee = txSet->getTxBaseFee(resTx, lhCopy);
+                auto baseFee = txSet->getTxBaseFee(resTx);
                 REQUIRE(baseFee);
                 if (baseFees[isDex] != 0)
                 {
-                    // All base fees should be the same among the transaction
-                    // categories.
+                    // All base fees should be the same among the
+                    // transaction categories.
                     REQUIRE(baseFees[isDex] == *baseFee);
                 }
                 else
@@ -1704,6 +1647,7 @@ TEST_CASE("surge pricing with DEX separation holds invariants",
                     baseFees[isDex] = *baseFee;
                 }
             }
+
             REQUIRE(opsCounts[0] + opsCounts[1] <=
                     cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE);
             if (maxDexOps)
@@ -2209,7 +2153,7 @@ testSCPDriver(uint32 protocolVersion, uint32_t maxTxSetSize, size_t expectedOps)
             tx->addSignature(root.getSecretKey());
             auto [txSet, applicableTxSet] =
                 testtxset::makeNonValidatedTxSetBasedOnLedgerVersion(
-                    protocolVersion, {tx}, *app,
+                    {tx}, *app,
                     app->getLedgerManager().getLastClosedLedgerHeader().hash);
 
             // Build a StellarValue containing the transaction set we just
@@ -2230,10 +2174,11 @@ testSCPDriver(uint32 protocolVersion, uint32_t maxTxSetSize, size_t expectedOps)
             // makeTxSetFromTransactions() trims the transaction if
             // and only if we expect it to be invalid.
             auto closeTimeOffset = nextCloseTime - lclCloseTime;
-            TxSetTransactions removed;
+            TxFrameList removed;
             TxSetUtils::trimInvalid(
-                applicableTxSet->getTxsForPhase(TxSetPhase::CLASSIC), *app,
-                closeTimeOffset, closeTimeOffset, removed);
+                applicableTxSet->getPhase(TxSetPhase::CLASSIC)
+                    .getSequentialTxs(),
+                *app, closeTimeOffset, closeTimeOffset, removed);
             REQUIRE(removed.size() == (expectValid ? 0 : 1));
         };
 
@@ -2562,11 +2507,6 @@ TEST_CASE("SCP State", "[herder]")
         };
 
     auto doTest = [&](bool forceSCP) {
-        SECTION("sqlite")
-        {
-            configure(Config::TestDbMode::TESTDB_ON_DISK_SQLITE);
-        }
-
         SECTION("bucketlistDB")
         {
             configure(Config::TestDbMode::TESTDB_BUCKET_DB_PERSISTENT);
@@ -2599,10 +2539,10 @@ TEST_CASE("SCP State", "[herder]")
 
         REQUIRE(sim->getNode(nodeIDs[0])
                     ->getLedgerManager()
-                    .getLastClosedLedgerNum() == expectedLedger);
+                    .getLastClosedLedgerNum() >= expectedLedger);
         REQUIRE(sim->getNode(nodeIDs[1])
                     ->getLedgerManager()
-                    .getLastClosedLedgerNum() == expectedLedger);
+                    .getLastClosedLedgerNum() >= expectedLedger);
 
         lcl = sim->getNode(nodeIDs[0])
                   ->getLedgerManager()
@@ -2700,7 +2640,7 @@ TEST_CASE("SCP State", "[herder]")
         // then let the nodes run a bit more, they should all externalize the
         // next ledger
         sim->crankUntil(
-            [&]() { return sim->haveAllExternalized(expectedLedger + 1, 5); },
+            [&]() { return sim->haveAllExternalized(expectedLedger + 2, 6); },
             2 * numLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
         // nodes are at least on ledger 7 (some may be on 8)
@@ -2709,14 +2649,6 @@ TEST_CASE("SCP State", "[herder]")
             // All nodes are in sync
             REQUIRE(sim->getNode(nodeIDs[i])->getState() ==
                     Application::State::APP_SYNCED_STATE);
-            auto const& actual = sim->getNode(nodeIDs[i])
-                                     ->getLedgerManager()
-                                     .getLastClosedLedgerHeader()
-                                     .header;
-            if (actual.ledgerSeq == expectedLedger + 1)
-            {
-                REQUIRE(actual.previousLedgerHash == lcl.hash);
-            }
         }
     }
 
@@ -2830,8 +2762,8 @@ TEST_CASE("SCP checkpoint", "[catchup][herder]")
 
     auto mainNode = simulation->addNode(v0SecretKey, qSet, &cfg1);
     simulation->startAllNodes();
-    auto& hm = mainNode->getHistoryManager();
-    auto firstCheckpoint = hm.firstLedgerAfterCheckpointContaining(1);
+    auto firstCheckpoint = HistoryManager::firstLedgerAfterCheckpointContaining(
+        1, mainNode->getConfig());
 
     // Crank until we are halfway through the second checkpoint
     simulation->crankUntil(
@@ -2850,7 +2782,8 @@ TEST_CASE("SCP checkpoint", "[catchup][herder]")
                 mainNode->getConfig().MAX_SLOTS_TO_REMEMBER + 1);
 
         auto secondCheckpoint =
-            hm.firstLedgerAfterCheckpointContaining(firstCheckpoint);
+            HistoryManager::firstLedgerAfterCheckpointContaining(
+                firstCheckpoint, mainNode->getConfig());
 
         // Crank until we complete the 2nd checkpoint
         simulation->crankUntil(
@@ -2874,15 +2807,15 @@ TEST_CASE("SCP checkpoint", "[catchup][herder]")
         auto outOfSync = simulation->addNode(v1SecretKey, qSet, &cfg2);
         simulation->addPendingConnection(v0NodeID, v1NodeID);
         simulation->startAllNodes();
-        auto& cm =
-            static_cast<CatchupManagerImpl&>(outOfSync->getCatchupManager());
+        auto& lam = static_cast<LedgerApplyManagerImpl&>(
+            outOfSync->getLedgerApplyManager());
 
         // Crank until outOfSync node has recieved checkpoint ledger and started
         // catchup
-        simulation->crankUntil([&]() { return cm.isCatchupInitialized(); },
+        simulation->crankUntil([&]() { return lam.isCatchupInitialized(); },
                                2 * Herder::SEND_LATEST_CHECKPOINT_DELAY, false);
 
-        auto const& bufferedLedgers = cm.getBufferedLedgers();
+        auto const& bufferedLedgers = lam.getBufferedLedgers();
         REQUIRE(!bufferedLedgers.empty());
         REQUIRE(bufferedLedgers.begin()->first == firstCheckpoint);
         REQUIRE(bufferedLedgers.crbegin()->first ==
@@ -2899,10 +2832,10 @@ TEST_CASE("SCP checkpoint", "[catchup][herder]")
         simulation->addPendingConnection(v0NodeID, v2NodeID);
 
         simulation->startAllNodes();
-        auto& cm1 =
-            static_cast<CatchupManagerImpl&>(outOfSync1->getCatchupManager());
-        auto& cm2 =
-            static_cast<CatchupManagerImpl&>(outOfSync2->getCatchupManager());
+        auto& cm1 = static_cast<LedgerApplyManagerImpl&>(
+            outOfSync1->getLedgerApplyManager());
+        auto& cm2 = static_cast<LedgerApplyManagerImpl&>(
+            outOfSync2->getLedgerApplyManager());
 
         // Crank until outOfSync node has recieved checkpoint ledger and started
         // catchup
@@ -3137,25 +3070,47 @@ TEST_CASE("soroban txs each parameter surge priced", "[soroban][herder]")
             bool hadSorobanSurgePricing = false;
             simulation->crankUntil(
                 [&]() {
-                    auto& lclHeader = nodes[0]
-                                          ->getLedgerManager()
-                                          .getLastClosedLedgerHeader()
-                                          .header;
+                    auto const& lclHeader = nodes[0]
+                                                ->getLedgerManager()
+                                                .getLastClosedLedgerHeader()
+                                                .header;
                     auto txSet = nodes[0]->getHerder().getTxSet(
                         lclHeader.scpValue.txSetHash);
                     GeneralizedTransactionSet xdrTxSet;
                     txSet->toXDR(xdrTxSet);
-                    auto const& components =
-                        xdrTxSet.v1TxSet()
-                            .phases.at(static_cast<size_t>(TxSetPhase::SOROBAN))
-                            .v0Components();
-                    if (!components.empty())
+                    auto const& phase = xdrTxSet.v1TxSet().phases.at(
+                        static_cast<size_t>(TxSetPhase::SOROBAN));
+                    std::optional<int64_t> baseFee;
+                    switch (phase.v())
                     {
-                        auto baseFee =
-                            components.at(0).txsMaybeDiscountedFee().baseFee;
-                        hadSorobanSurgePricing = hadSorobanSurgePricing ||
-                                                 (baseFee && *baseFee > 100);
+                    case 0:
+                        if (!phase.v0Components().empty() &&
+                            phase.v0Components()
+                                .at(0)
+                                .txsMaybeDiscountedFee()
+                                .baseFee)
+                        {
+
+                            baseFee = *phase.v0Components()
+                                           .at(0)
+                                           .txsMaybeDiscountedFee()
+                                           .baseFee;
+                        }
+                        break;
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+                    case 1:
+                        if (phase.parallelTxsComponent().baseFee)
+                        {
+                            baseFee = *phase.parallelTxsComponent().baseFee;
+                        }
+                        break;
+#endif
+                    default:
+                        releaseAssert(false);
                     }
+
+                    hadSorobanSurgePricing =
+                        hadSorobanSurgePricing || (baseFee && *baseFee > 100);
 
                     return loadGenDone.count() > currLoadGenCount &&
                            secondLoadGenDone.count() > secondLoadGenCount;
@@ -3250,118 +3205,41 @@ TEST_CASE("soroban txs each parameter surge priced", "[soroban][herder]")
     }
 }
 
-TEST_CASE("accept soroban txs after network upgrade", "[soroban][herder]")
-{
-    auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
-
-    auto simulation =
-        Topologies::core(4, 1, Simulation::OVER_LOOPBACK, networkID, [](int i) {
-            auto cfg = getTestConfig(i, Config::TESTDB_ON_DISK_SQLITE);
-            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
-            cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
-                static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION) - 1;
-            return cfg;
-        });
-
-    simulation->startAllNodes();
-    auto nodes = simulation->getNodes();
-    uint32_t numAccounts = 100;
-    auto& loadGen = nodes[0]->getLoadGenerator();
-
-    // Generate some accounts
-    auto& loadGenDone =
-        nodes[0]->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
-    auto currLoadGenCount = loadGenDone.count();
-    loadGen.generateLoad(
-        GeneratedLoadConfig::createAccountsLoad(numAccounts, 1));
-    simulation->crankUntil(
-        [&]() { return loadGenDone.count() > currLoadGenCount; },
-        10 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
-
-    // Ensure more transactions get in the ledger post upgrade
-    ConfigUpgradeSetFrameConstPtr res;
-    Upgrades::UpgradeParameters scheduledUpgrades;
-    scheduledUpgrades.mUpgradeTime =
-        VirtualClock::from_time_t(nodes[0]
-                                      ->getLedgerManager()
-                                      .getLastClosedLedgerHeader()
-                                      .header.scpValue.closeTime +
-                                  15);
-    scheduledUpgrades.mProtocolVersion =
-        static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION);
-    for (auto const& app : nodes)
-    {
-        app->getHerder().setUpgrades(scheduledUpgrades);
-    }
-
-    auto& secondLoadGen = nodes[1]->getLoadGenerator();
-    auto& secondLoadGenDone =
-        nodes[1]->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
-    currLoadGenCount = loadGenDone.count();
-    auto secondLoadGenCount = secondLoadGenDone.count();
-
-    // Generate classic txs from another node (with offset to prevent
-    // overlapping accounts)
-    secondLoadGen.generateLoad(GeneratedLoadConfig::txLoad(LoadGenMode::PAY, 50,
-                                                           /* nTxs */ 100, 2,
-                                                           /* offset */ 50));
-
-    // Crank a bit and verify that upgrade went through
-    simulation->crankForAtLeast(4 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
-    REQUIRE(nodes[0]
-                ->getLedgerManager()
-                .getLastClosedLedgerHeader()
-                .header.ledgerVersion ==
-            static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION));
-    for (auto node : nodes)
-    {
-        overrideSorobanNetworkConfigForTest(*node);
-    }
-    // Now generate Soroban txs
-    auto sorobanConfig =
-        GeneratedLoadConfig::txLoad(LoadGenMode::SOROBAN_UPLOAD, 50,
-                                    /* nTxs */ 15, 1, /* offset */ 0);
-    sorobanConfig.skipLowFeeTxs = true;
-    loadGen.generateLoad(sorobanConfig);
-    auto& loadGenFailed =
-        nodes[0]->getMetrics().NewMeter({"loadgen", "run", "failed"}, "run");
-    auto& secondLoadGenFailed =
-        nodes[1]->getMetrics().NewMeter({"loadgen", "run", "failed"}, "run");
-
-    simulation->crankUntil(
-        [&]() {
-            return loadGenDone.count() > currLoadGenCount &&
-                   secondLoadGenDone.count() > secondLoadGenCount;
-        },
-        200 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
-    REQUIRE(loadGenFailed.count() == 0);
-    REQUIRE(secondLoadGenFailed.count() == 0);
-
-    //  Ensure some Soroban txs got into the ledger
-    auto totalSoroban =
-        nodes[0]
-            ->getMetrics()
-            .NewMeter({"soroban", "host-fn-op", "success"}, "call")
-            .count() +
-        nodes[0]
-            ->getMetrics()
-            .NewMeter({"soroban", "host-fn-op", "failure"}, "call")
-            .count();
-    REQUIRE(totalSoroban > 0);
-}
-
 TEST_CASE("overlay parallel processing")
 {
     auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
 
-    // Set threshold to 1 so all have to vote
-    auto simulation =
-        Topologies::core(4, 1, Simulation::OVER_TCP, networkID, [](int i) {
-            auto cfg = getTestConfig(i);
-            cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
-            cfg.EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING = true;
-            return cfg;
-        });
+    std::shared_ptr<Simulation> simulation;
+
+    SECTION("background traffic processing")
+    {
+        // Set threshold to 1 so all have to vote
+        simulation =
+            Topologies::core(4, 1, Simulation::OVER_TCP, networkID, [](int i) {
+                auto cfg = getTestConfig(i);
+                cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
+                cfg.BACKGROUND_OVERLAY_PROCESSING = true;
+                return cfg;
+            });
+    }
+
+// Background ledger close requires postgres
+#ifdef USE_POSTGRES
+    SECTION("background ledger close")
+    {
+        // Set threshold to 1 so all have to vote
+        simulation =
+            Topologies::core(4, 1, Simulation::OVER_TCP, networkID, [](int i) {
+                auto cfg = getTestConfig(i, Config::TESTDB_POSTGRESQL);
+                cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 100;
+                cfg.EXPERIMENTAL_PARALLEL_LEDGER_APPLY = true;
+                cfg.ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =
+                    std::chrono::milliseconds(500);
+                return cfg;
+            });
+    }
+#endif
+
     simulation->startAllNodes();
     auto nodes = simulation->getNodes();
     uint32_t desiredTxRate = 1;
@@ -3393,15 +3271,15 @@ TEST_CASE("overlay parallel processing")
     // soroban traffic
     currLoadGenCount = loadGenDone.count();
     auto secondLoadGenCount = secondLoadGenDone.count();
-    uint32_t const classicTxCount = 200;
+    uint32_t const txCount = 100;
     // Generate Soroban txs from one node
     loadGen.generateLoad(GeneratedLoadConfig::txLoad(
         LoadGenMode::SOROBAN_UPLOAD, 50,
-        /* nTxs */ 500, desiredTxRate, /* offset */ 0));
+        /* nTxs */ txCount, desiredTxRate, /* offset */ 0));
     // Generate classic txs from another node (with offset to prevent
     // overlapping accounts)
     secondLoadGen.generateLoad(GeneratedLoadConfig::txLoad(
-        LoadGenMode::PAY, 50, classicTxCount, desiredTxRate,
+        LoadGenMode::PAY, 50, txCount, desiredTxRate,
         /* offset */ 50));
 
     simulation->crankUntil(
@@ -3512,7 +3390,7 @@ TEST_CASE("soroban txs accepted by the network",
             for (auto node : nodes)
             {
                 REQUIRE(node->getLedgerManager()
-                            .getSorobanNetworkConfig()
+                            .getLastClosedSorobanNetworkConfig()
                             .ledgerMaxTxCount() == ledgerWideLimit * 10);
             }
 
@@ -3614,7 +3492,7 @@ static void
 checkSynced(Application& app)
 {
     REQUIRE(app.getLedgerManager().isSynced());
-    REQUIRE(!app.getCatchupManager().maybeGetNextBufferedLedgerToApply());
+    REQUIRE(!app.getLedgerApplyManager().maybeGetNextBufferedLedgerToApply());
 }
 
 void
@@ -3635,42 +3513,6 @@ checkHerder(Application& app, HerderImpl& herder, Herder::State expectedState,
     REQUIRE(herder.trackingConsensusLedgerIndex() == ledger);
 }
 
-// Either setup a v19 -> v20 upgrade, or a fee upgrade in v20
-static void
-setupUpgradeAtNextLedger(Application& app)
-{
-    Upgrades::UpgradeParameters scheduledUpgrades;
-    scheduledUpgrades.mUpgradeTime =
-        VirtualClock::from_time_t(app.getLedgerManager()
-                                      .getLastClosedLedgerHeader()
-                                      .header.scpValue.closeTime +
-                                  5);
-    if (protocolVersionIsBefore(app.getLedgerManager()
-                                    .getLastClosedLedgerHeader()
-                                    .header.ledgerVersion,
-                                SOROBAN_PROTOCOL_VERSION))
-    {
-        scheduledUpgrades.mProtocolVersion =
-            static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION);
-    }
-    else
-    {
-        LedgerTxn ltx(app.getLedgerTxnRoot());
-        ConfigUpgradeSetFrameConstPtr configUpgradeSet;
-        ConfigUpgradeSet configUpgradeSetXdr;
-        auto& configEntry = configUpgradeSetXdr.updatedEntry.emplace_back();
-        configEntry.configSettingID(CONFIG_SETTING_CONTRACT_BANDWIDTH_V0);
-        configEntry.contractBandwidth().ledgerMaxTxsSizeBytes = 1'000'000;
-        configEntry.contractBandwidth().txMaxSizeBytes = 500'000;
-
-        configUpgradeSet = makeConfigUpgradeSet(ltx, configUpgradeSetXdr);
-
-        scheduledUpgrades.mConfigUpgradeSetKey = configUpgradeSet->getKey();
-        ltx.commit();
-    }
-    app.getHerder().setUpgrades(scheduledUpgrades);
-}
-
 // The main purpose of this test is to ensure the externalize path works
 // correctly. This entails properly updating tracking in Herder, forwarding
 // externalize information to LM, and Herder appropriately reacting to ledger
@@ -3680,13 +3522,32 @@ setupUpgradeAtNextLedger(Application& app)
 // received by a node, we fully control the state of Herder and LM (and whether
 // each component is in sync or out of sync)
 static void
-herderExternalizesValuesWithProtocol(uint32_t version)
+herderExternalizesValuesWithProtocol(uint32_t version,
+                                     bool parallelLedgerClose = false,
+                                     uint32_t delayCloseMs = 0)
 {
     auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
     auto simulation = std::make_shared<Simulation>(
-        Simulation::OVER_LOOPBACK, networkID, [version](int i) {
-            auto cfg = getTestConfig(i, Config::TESTDB_ON_DISK_SQLITE);
+        Simulation::OVER_LOOPBACK, networkID, [&](int i) {
+            Config::TestDbMode dbMode = Config::TESTDB_BUCKET_DB_PERSISTENT;
+            if (parallelLedgerClose)
+            {
+#ifdef USE_POSTGRES
+                dbMode = Config::TESTDB_POSTGRESQL;
+#else
+                FAIL("Parallel ledger apply requires postgres");
+#endif
+            }
+            auto cfg = getTestConfig(i, dbMode);
             cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = version;
+            if (parallelLedgerClose)
+            {
+                cfg.EXPERIMENTAL_PARALLEL_LEDGER_APPLY = true;
+                // Add artifical delay to ledger close to increase chances of
+                // conflicts
+                cfg.ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =
+                    std::chrono::milliseconds(delayCloseMs);
+            }
             return cfg;
         });
 
@@ -3718,14 +3579,11 @@ herderExternalizesValuesWithProtocol(uint32_t version)
             Herder::State::HERDER_BOOTING_STATE);
 
     simulation->startAllNodes();
-    if (protocolVersionStartsFrom(version, SOROBAN_PROTOCOL_VERSION))
-    {
-        upgradeSorobanNetworkConfig(
-            [&](SorobanNetworkConfig& cfg) {
-                cfg.mStateArchivalSettings.bucketListWindowSamplePeriod = 1;
-            },
-            simulation);
-    }
+    upgradeSorobanNetworkConfig(
+        [&](SorobanNetworkConfig& cfg) {
+            cfg.mStateArchivalSettings.bucketListWindowSamplePeriod = 1;
+        },
+        simulation);
 
     // After SCP is restored, Herder is tracking
     REQUIRE(getC()->getHerder().getState() ==
@@ -3747,7 +3605,7 @@ herderExternalizesValuesWithProtocol(uint32_t version)
             [&]() {
                 return simulation->haveAllExternalized(destinationLedger, 100);
             },
-            2 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+            10 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
         return std::min(currentALedger(), currentCLedger());
     };
 
@@ -3799,21 +3657,26 @@ herderExternalizesValuesWithProtocol(uint32_t version)
     REQUIRE(currentALedger() >= currentLedger);
     REQUIRE(currentCLedger() == currentLedger);
 
+    // Arm the upgrade, but don't close the upgrade ledger yet
+    // C won't upgrade until it's on the right LCL
+    upgradeSorobanNetworkConfig(
+        [&](SorobanNetworkConfig& cfg) {
+            cfg.mLedgerMaxTransactionsSizeBytes = 1'000'000;
+            cfg.mTxMaxSizeBytes = 500'000;
+        },
+        simulation, /*applyUpgrade=*/false);
+
     // disconnect C
     simulation->dropConnection(validatorAKey.getPublicKey(),
                                validatorCKey.getPublicKey());
+
+    currentLedger = currentALedger();
 
     // Advance A and B a bit further, and collect externalize messages
     std::map<uint32_t, std::pair<SCPEnvelope, StellarMessage>>
         validatorSCPMessagesA;
     std::map<uint32_t, std::pair<SCPEnvelope, StellarMessage>>
         validatorSCPMessagesB;
-
-    for (auto& node : {A, B, getC()})
-    {
-        // C won't upgrade until it's on the right LCL
-        setupUpgradeAtNextLedger(*node);
-    }
 
     auto destinationLedger = waitForAB(4, true);
     for (auto start = currentLedger + 1; start <= destinationLedger; start++)
@@ -3862,6 +3725,7 @@ herderExternalizesValuesWithProtocol(uint32_t version)
                 Herder::ENVELOPE_STATUS_READY);
         REQUIRE(herder.recvSCPEnvelope(newMsgB.first, qset, newMsgB.second) ==
                 Herder::ENVELOPE_STATUS_READY);
+        simulation->crankForAtLeast(std::chrono::seconds(10), false);
     };
 
     auto testOutOfOrder = [&](bool partial) {
@@ -3876,7 +3740,7 @@ herderExternalizesValuesWithProtocol(uint32_t version)
                                    validatorBKey.getPublicKey());
 
         // Externalize future ledger
-        // This should trigger CatchupManager to start buffering ledgers
+        // This should trigger LedgerApplyManager to start buffering ledgers
         // Ensure C processes future tx set and its fees correctly (even though
         // its own ledger state isn't upgraded yet)
         receiveLedger(fourth, herderC);
@@ -3906,7 +3770,7 @@ herderExternalizesValuesWithProtocol(uint32_t version)
         // buffered ledgers
         // complete - all messages are received out of order
         // partial - only most recent ledger is received out of order
-        // CatchupManager should apply buffered ledgers and let LM get back
+        // LedgerApplyManager should apply buffered ledgers and let LM get back
         // in sync
         std::vector<uint32_t> ledgers{first, third, second};
         if (partial)
@@ -3921,7 +3785,7 @@ herderExternalizesValuesWithProtocol(uint32_t version)
             // Tracking did not change
             checkHerder(*(getC()), herderC,
                         Herder::State::HERDER_TRACKING_NETWORK_STATE, fourth);
-            REQUIRE(!getC()->getCatchupManager().isCatchupInitialized());
+            REQUIRE(!getC()->getLedgerApplyManager().isCatchupInitialized());
 
             // At the last ledger, LM is back in sync
             if (i == ledgers.size() - 1)
@@ -4145,14 +4009,15 @@ herderExternalizesValuesWithProtocol(uint32_t version)
 
 TEST_CASE("herder externalizes values", "[herder]")
 {
-    SECTION("v19")
-    {
-        herderExternalizesValuesWithProtocol(19);
-    }
-    SECTION("soroban")
+    SECTION("prev protocol")
     {
         herderExternalizesValuesWithProtocol(
-            static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION));
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION - 1);
+    }
+    SECTION("curr protocol")
+    {
+        herderExternalizesValuesWithProtocol(
+            Config::CURRENT_LEDGER_PROTOCOL_VERSION);
     }
 }
 
@@ -4404,7 +4269,7 @@ externalize(SecretKey const& sk, LedgerManager& lm, HerderImpl& herder,
 
     auto classicTxs = txs;
 
-    TxSetTransactions sorobanTxs;
+    TxFrameList sorobanTxs;
     for (auto it = classicTxs.begin(); it != classicTxs.end();)
     {
         if ((*it)->isSoroban())
@@ -4418,7 +4283,7 @@ externalize(SecretKey const& sk, LedgerManager& lm, HerderImpl& herder,
         }
     }
 
-    TxSetPhaseTransactions txsPhases{classicTxs};
+    PerPhaseTransactionList txsPhases{classicTxs};
 
     txsPhases.emplace_back(sorobanTxs);
 
@@ -4441,6 +4306,7 @@ TEST_CASE("do not flood invalid transactions", "[herder]")
     VirtualClock clock;
     auto cfg = getTestConfig();
     cfg.FLOOD_TX_PERIOD_MS = 1; // flood as fast as possible
+    cfg.ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING = std::chrono::seconds(0);
     auto app = createTestApplication(clock, cfg);
 
     auto& lm = app->getLedgerManager();
@@ -4472,12 +4338,11 @@ TEST_CASE("do not flood invalid transactions", "[herder]")
 
     auto const& lhhe = lm.getLastClosedLedgerHeader();
     auto txs = tq.getTransactions(lhhe.header);
-    auto txSet = makeTxSetFromTransactions(txs, *app, 0, 0).second;
-    REQUIRE(txSet->sizeTxTotal() == 1);
-    REQUIRE(
-        txSet->getTxsForPhase(TxSetPhase::CLASSIC).front()->getContentsHash() ==
-        tx1a->getContentsHash());
-    REQUIRE(txSet->checkValid(*app, 0, 0));
+    auto [_, applicableTxSet] = makeTxSetFromTransactions(txs, *app, 0, 0);
+    REQUIRE(applicableTxSet->sizeTxTotal() == 1);
+    REQUIRE((*applicableTxSet->getPhase(TxSetPhase::CLASSIC).begin())
+                ->getContentsHash() == tx1a->getContentsHash());
+    REQUIRE(applicableTxSet->checkValid(*app, 0, 0));
 }
 
 TEST_CASE("do not flood too many soroban transactions",
@@ -4494,6 +4359,8 @@ TEST_CASE("do not flood too many soroban transactions",
             cfg.FLOOD_OP_RATE_PER_LEDGER = 2.0;
             cfg.FLOOD_SOROBAN_TX_PERIOD_MS = 50;
             cfg.FLOOD_SOROBAN_RATE_PER_LEDGER = 2.0;
+            cfg.ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING =
+                std::chrono::seconds(0);
             return cfg;
         });
 
@@ -5463,7 +5330,8 @@ TEST_CASE("SCP message capture from previous ledger", "[herder]")
             // Prepare query
             auto& db = node->getDatabase();
             auto prep = db.getPreparedStatement(
-                "SELECT envelope FROM scphistory WHERE ledgerseq = :l");
+                "SELECT envelope FROM scphistory WHERE ledgerseq = :l",
+                db.getSession());
             auto& st = prep.statement();
             st.exchange(soci::use(ledgerNum));
             std::string envStr;
@@ -5554,11 +5422,936 @@ TEST_CASE("SCP message capture from previous ledger", "[herder]")
     simulation->addConnection(validatorCKey.getPublicKey(),
                               validatorBKey.getPublicKey());
     simulation->crankUntil(
-        [&]() { return C->getLedgerManager().getLastClosedLedgerNum() == 3; },
+        [&]() { return C->getLedgerManager().getLastClosedLedgerNum() >= 3; },
         4 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
     // C should have 3 EXTERNALIZEs in its scphistory table for ledger 2. This
     // check ensures that C does not double count messages from ledger 2 when
     // closing ledger 3.
     REQUIRE(checkSCPHistoryEntries(C, 2, expectedTypes));
+}
+
+using Topology = std::pair<std::vector<SecretKey>, std::vector<ValidatorEntry>>;
+
+// Generate a Topology with a single org containing 3 validators of HIGH quality
+static Topology
+simpleThreeNode()
+{
+    // Generate validators
+    std::vector<SecretKey> sks;
+    std::vector<ValidatorEntry> validators;
+    int constexpr numValidators = 3;
+    for (int i = 0; i < numValidators; ++i)
+    {
+        SecretKey const& key = sks.emplace_back(SecretKey::random());
+        ValidatorEntry& entry = validators.emplace_back();
+        entry.mName = fmt::format("validator-{}", i);
+        entry.mHomeDomain = "A";
+        entry.mQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+        entry.mKey = key.getPublicKey();
+        entry.mHasHistory = false;
+    }
+    return {sks, validators};
+}
+
+// Generate a topology with 3 orgs of HIGH quality. Two orgs have 3 validators
+// and one org has 5 validators.
+static Topology
+unbalancedOrgs()
+{
+    // Generate validators
+    std::vector<SecretKey> sks;
+    std::vector<ValidatorEntry> validators;
+    int constexpr numValidators = 11;
+    for (int i = 0; i < numValidators; ++i)
+    {
+        // Orgs A and B have 3 validators each. Org C has 5 validators.
+        std::string org = "C";
+        if (i < 3)
+        {
+            org = "A";
+        }
+        else if (i < 6)
+        {
+            org = "B";
+        }
+
+        SecretKey const& key = sks.emplace_back(SecretKey::random());
+        ValidatorEntry& entry = validators.emplace_back();
+        entry.mName = fmt::format("validator-{}", i);
+        entry.mHomeDomain = org;
+        entry.mQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+        entry.mKey = key.getPublicKey();
+        entry.mHasHistory = false;
+    }
+    return {sks, validators};
+}
+
+// Generate a tier1-like topology. This topology has 7 HIGH quality orgs, 6 of
+// which have 3 validators and 1 has 5 validators.
+static Topology
+teir1Like()
+{
+    std::vector<SecretKey> sks;
+    std::vector<ValidatorEntry> validators;
+    int constexpr numOrgs = 7;
+
+    for (int i = 0; i < numOrgs; ++i)
+    {
+        std::string const org = fmt::format("org-{}", i);
+        int const numValidators = i == 0 ? 5 : 3;
+        for (int j = 0; j < numValidators; ++j)
+        {
+            SecretKey const& key = sks.emplace_back(SecretKey::random());
+            ValidatorEntry& entry = validators.emplace_back();
+            entry.mName = fmt::format("validator-{}-{}", i, j);
+            entry.mHomeDomain = org;
+            entry.mQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+            entry.mKey = key.getPublicKey();
+            entry.mHasHistory = false;
+        }
+    }
+
+    return {sks, validators};
+}
+
+// Returns a random quality up to `maxQuality`
+static ValidatorQuality
+randomQuality(ValidatorQuality maxQuality)
+{
+    return static_cast<ValidatorQuality>(rand_uniform<int>(
+        static_cast<int>(ValidatorQuality::VALIDATOR_LOW_QUALITY),
+        static_cast<int>(maxQuality)));
+}
+
+// Returns the minimum size an org of quality `q` can have
+static int constexpr minOrgSize(ValidatorQuality q)
+{
+    switch (q)
+    {
+    case ValidatorQuality::VALIDATOR_LOW_QUALITY:
+    case ValidatorQuality::VALIDATOR_MED_QUALITY:
+        return 1;
+    case ValidatorQuality::VALIDATOR_HIGH_QUALITY:
+    case ValidatorQuality::VALIDATOR_CRITICAL_QUALITY:
+        return 3;
+    }
+}
+
+// Generate a random topology with up to `maxValidators` validators. Ensures at
+// least one org is HIGH quality.
+static Topology
+randomTopology(int maxValidators)
+{
+    int const numValidators = rand_uniform<int>(3, maxValidators);
+    int constexpr minCritOrgSize =
+        minOrgSize(ValidatorQuality::VALIDATOR_CRITICAL_QUALITY);
+
+    // Generate validators
+    int curOrg = 0;
+    int curOrgSize = 0;
+    ValidatorQuality curQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+    std::vector<SecretKey> sks(numValidators);
+    std::vector<ValidatorEntry> validators(numValidators);
+    for (int i = 0; i < numValidators; ++i)
+    {
+        if (curOrgSize >= minOrgSize(curQuality) && rand_flip())
+        {
+            // Start new org
+            ++curOrg;
+            curOrgSize = 0;
+            curQuality =
+                randomQuality(numValidators - i >= minCritOrgSize
+                                  ? ValidatorQuality::VALIDATOR_CRITICAL_QUALITY
+                                  : ValidatorQuality::VALIDATOR_MED_QUALITY);
+        }
+
+        std::string const org = fmt::format("org-{}", curOrg);
+        SecretKey const& key = sks.at(i) = SecretKey::random();
+
+        ValidatorEntry& entry = validators.at(i);
+        entry.mName = fmt::format("validator-{}", i);
+        entry.mHomeDomain = org;
+        entry.mQuality = curQuality;
+        entry.mKey = key.getPublicKey();
+        entry.mHasHistory = false;
+
+        ++curOrgSize;
+    }
+
+    return {sks, validators};
+}
+
+// Expected weight of an org with quality `orgQuality` in a topology with a max
+// quality of `maxQuality` and or quality counts of `orgQualityCounts`. This
+// function normalizes the weight so that the highest quality has a weight of
+// `1`.
+static double
+expectedOrgNormalizedWeight(
+    std::unordered_map<ValidatorQuality, uint64> const& orgQualityCounts,
+    ValidatorQuality maxQuality, ValidatorQuality orgQuality)
+{
+    if (orgQuality == ValidatorQuality::VALIDATOR_LOW_QUALITY)
+    {
+        return 0.0;
+    }
+
+    double normalizedWeight = 1.0;
+
+    // For each quality level higher than `orgQuality`, divide the weight by 10
+    // times the number of orgs at that quality level
+    for (int q = static_cast<int>(maxQuality); q > static_cast<int>(orgQuality);
+         --q)
+    {
+        normalizedWeight /=
+            10 * orgQualityCounts.at(static_cast<ValidatorQuality>(q));
+    }
+    return normalizedWeight;
+}
+
+// Expected weight of a validator in an org of size `orgSize` with quality
+// `orgQuality`.  `maxQuality` is the maximum quality present in the
+// configuration. This function normalizes the weight so that the highest
+// organization-level quality has a weight of `1`.
+static double
+expectedNormalizedWeight(
+    std::unordered_map<ValidatorQuality, uint64> const& orgQualityCounts,
+    ValidatorQuality maxQuality, ValidatorQuality orgQuality, int orgSize)
+{
+    return expectedOrgNormalizedWeight(orgQualityCounts, maxQuality,
+                                       orgQuality) /
+           orgSize;
+}
+
+// Collect information about the qualities and sizes of organizations in
+// `validators` and store them in `maxQuality`, `orgQualities`, `orgSizes`, and
+// `orgQualityCounts`.
+static void
+collectOrgInfo(ValidatorQuality& maxQuality,
+               std::unordered_map<std::string, ValidatorQuality>& orgQualities,
+               std::unordered_map<std::string, int>& orgSizes,
+               std::unordered_map<ValidatorQuality, uint64>& orgQualityCounts,
+               std::vector<ValidatorEntry> const& validators)
+{
+    maxQuality = ValidatorQuality::VALIDATOR_LOW_QUALITY;
+    ValidatorQuality minQuality = ValidatorQuality::VALIDATOR_CRITICAL_QUALITY;
+    std::unordered_map<ValidatorQuality, std::unordered_set<std::string>>
+        orgsByQuality;
+    for (ValidatorEntry const& validator : validators)
+    {
+        maxQuality = std::max(maxQuality, validator.mQuality);
+        minQuality = std::min(minQuality, validator.mQuality);
+        orgQualities[validator.mHomeDomain] = validator.mQuality;
+        ++orgSizes[validator.mHomeDomain];
+        orgsByQuality[validator.mQuality].insert(validator.mHomeDomain);
+    }
+
+    // Count orgs at each quality level
+    for (int q = static_cast<int>(minQuality);
+         q <= static_cast<int>(maxQuality); ++q)
+    {
+        orgQualityCounts[static_cast<ValidatorQuality>(q)] =
+            orgsByQuality[static_cast<ValidatorQuality>(q)].size();
+        if (q != static_cast<int>(minQuality))
+        {
+            // Add virtual org covering next lower quality level
+            ++orgQualityCounts[static_cast<ValidatorQuality>(q)];
+        }
+    }
+}
+
+// Given a list of validators, test that the weights of the validators herder
+// reports are correct
+static void
+testWeights(std::vector<ValidatorEntry> const& validators)
+{
+    Config cfg = getTestConfig(0);
+
+    cfg.generateQuorumSetForTesting(validators);
+
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    // Collect info about orgs
+    ValidatorQuality maxQuality;
+    std::unordered_map<std::string, ValidatorQuality> orgQualities;
+    std::unordered_map<std::string, int> orgSizes;
+    std::unordered_map<ValidatorQuality, uint64> orgQualityCounts;
+    collectOrgInfo(maxQuality, orgQualities, orgSizes, orgQualityCounts,
+                   validators);
+
+    // Check per-validator weights
+    HerderImpl& herder = dynamic_cast<HerderImpl&>(app->getHerder());
+    std::unordered_map<std::string, double> normalizedOrgWeights;
+    for (ValidatorEntry const& validator : validators)
+    {
+        uint64_t weight = herder.getHerderSCPDriver().getNodeWeight(
+            validator.mKey, cfg.QUORUM_SET, false);
+        double normalizedWeight = static_cast<double>(weight) / UINT64_MAX;
+        normalizedOrgWeights[validator.mHomeDomain] += normalizedWeight;
+
+        std::string const& org = validator.mHomeDomain;
+        REQUIRE_THAT(normalizedWeight,
+                     Catch::Matchers::WithinAbs(
+                         expectedNormalizedWeight(orgQualityCounts, maxQuality,
+                                                  orgQualities.at(org),
+                                                  orgSizes.at(org)),
+                         0.0001));
+    }
+
+    // Check per-org weights
+    for (auto const& [org, weight] : normalizedOrgWeights)
+    {
+        REQUIRE_THAT(
+            weight, Catch::Matchers::WithinAbs(
+                        expectedOrgNormalizedWeight(
+                            orgQualityCounts, maxQuality, orgQualities.at(org)),
+                        0.0001));
+    }
+}
+
+// Test that HerderSCPDriver::getNodeWeight produces weights that result in a
+// fair distribution of nomination wins.
+TEST_CASE("getNodeWeight", "[herder]")
+{
+    SECTION("3 tier 1 validators, 1 org")
+    {
+        testWeights(simpleThreeNode().second);
+    }
+
+    SECTION("11 tier 1 validators, 3 unbalanced orgs")
+    {
+        testWeights(unbalancedOrgs().second);
+    }
+
+    SECTION("Tier1-like topology")
+    {
+        testWeights(teir1Like().second);
+    }
+
+    SECTION("Random topology")
+    {
+        // Test weights for 1000 random topologies of up to 200 validators
+        for (int i = 0; i < 1000; ++i)
+        {
+            testWeights(randomTopology(200).second);
+        }
+    }
+}
+
+static Value
+getRandomValue()
+{
+    auto h = sha256(fmt::format("value {}", gRandomEngine()));
+    return xdr::xdr_to_opaque(h);
+}
+
+// A test version of NominationProtocol that exposes `updateRoundLeaders`
+class TestNominationProtocol : public NominationProtocol
+{
+  public:
+    TestNominationProtocol(Slot& slot) : NominationProtocol(slot)
+    {
+    }
+
+    std::set<NodeID> const&
+    updateRoundLeadersForTesting(
+        std::optional<Value> const& previousValue = std::nullopt)
+    {
+        mPreviousValue = previousValue.value_or(getRandomValue());
+        updateRoundLeaders();
+        return getLeaders();
+    }
+
+    // Detect fast timeouts by examining the final round number
+    bool
+    fastTimedOut() const
+    {
+        return mRoundNumber > 0;
+    }
+};
+
+// Test nomination over `numLedgers` slots. After running, check that the win
+// percentages of each node and org are within 5% of the expected win
+// percentages.
+static void
+testWinProbabilities(std::vector<SecretKey> const& sks,
+                     std::vector<ValidatorEntry> const& validators,
+                     int const numLedgers)
+{
+    REQUIRE(sks.size() == validators.size());
+
+    // Collect info about orgs
+    ValidatorQuality maxQuality;
+    std::unordered_map<std::string, ValidatorQuality> orgQualities;
+    std::unordered_map<std::string, int> orgSizes;
+    std::unordered_map<ValidatorQuality, uint64> orgQualityCounts;
+    collectOrgInfo(maxQuality, orgQualities, orgSizes, orgQualityCounts,
+                   validators);
+
+    // Generate a config
+    Config cfg = getTestConfig();
+    cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+    cfg.generateQuorumSetForTesting(validators);
+    cfg.NODE_SEED = sks.front();
+
+    // Create an application
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    // Run for `numLedgers` slots, recording the number of times each
+    // node wins nomination
+    UnorderedMap<NodeID, int> publishCounts;
+    HerderImpl& herder = dynamic_cast<HerderImpl&>(app->getHerder());
+    SCP& scp = herder.getSCP();
+    int fastTimeouts = 0;
+    for (int i = 0; i < numLedgers; ++i)
+    {
+        auto s = std::make_shared<Slot>(i, scp);
+        TestNominationProtocol np(*s);
+
+        std::set<NodeID> const& leaders = np.updateRoundLeadersForTesting();
+        REQUIRE(leaders.size() == 1);
+        for (NodeID const& leader : leaders)
+        {
+            ++publishCounts[leader];
+        }
+
+        if (np.fastTimedOut())
+        {
+            ++fastTimeouts;
+        }
+    }
+
+    CLOG_INFO(Herder, "Fast Timeouts: {} ({}%)", fastTimeouts,
+              fastTimeouts * 100.0 / numLedgers);
+
+    // Compute total expected normalized weight across all nodes
+    double totalNormalizedWeight = 0.0;
+    for (ValidatorEntry const& validator : validators)
+    {
+        totalNormalizedWeight +=
+            expectedNormalizedWeight(orgQualityCounts, maxQuality,
+                                     orgQualities.at(validator.mHomeDomain),
+                                     orgSizes.at(validator.mHomeDomain));
+    }
+
+    // Check validator win rates
+    std::map<std::string, int> orgPublishCounts;
+    for (ValidatorEntry const& validator : validators)
+    {
+        NodeID const& nodeID = validator.mKey;
+        int publishCount = publishCounts[nodeID];
+
+        // Compute and report node's win rate
+        double winRate = static_cast<double>(publishCount) / numLedgers;
+        CLOG_INFO(Herder, "Node {} win rate: {} (published {} ledgers)",
+                  cfg.toShortString(nodeID), winRate, publishCount);
+
+        // Expected win rate is `weight / total weight`
+        double expectedWinRate =
+            expectedNormalizedWeight(orgQualityCounts, maxQuality,
+                                     orgQualities.at(validator.mHomeDomain),
+                                     orgSizes.at(validator.mHomeDomain)) /
+            totalNormalizedWeight;
+
+        // Check that actual win rate is within .05 of expected win
+        // rate.
+        REQUIRE_THAT(winRate,
+                     Catch::Matchers::WithinAbs(expectedWinRate, 0.05));
+
+        // Record org publish counts for the next set of checks
+        orgPublishCounts[validator.mHomeDomain] += publishCount;
+    }
+
+    // Check org win rates
+    for (auto const& [org, count] : orgPublishCounts)
+    {
+        // Compute and report org's win rate
+        double winRate = static_cast<double>(count) / numLedgers;
+        CLOG_INFO(Herder, "Org {} win rate: {} (published {} ledgers)", org,
+                  winRate, count);
+
+        // Expected win rate is `weight / total weight`
+        double expectedWinRate =
+            expectedOrgNormalizedWeight(orgQualityCounts, maxQuality,
+                                        orgQualities.at(org)) /
+            totalNormalizedWeight;
+
+        // Check that actual win rate is within .05 of expected win
+        // rate.
+        REQUIRE_THAT(winRate,
+                     Catch::Matchers::WithinAbs(expectedWinRate, 0.05));
+    }
+}
+
+// Test that the nomination algorithm produces a fair distribution of ledger
+// publishers.
+TEST_CASE("Fair nomination win rates", "[herder]")
+{
+    SECTION("3 tier 1 validators, 1 org")
+    {
+        auto [sks, validators] = simpleThreeNode();
+        testWinProbabilities(sks, validators, 10000);
+    }
+
+    SECTION("11 tier 1 validators, 3 unbalanced orgs")
+    {
+        auto [sks, validators] = unbalancedOrgs();
+        testWinProbabilities(sks, validators, 10000);
+    }
+
+    SECTION("Tier 1-like topology")
+    {
+        auto [sks, validators] = teir1Like();
+        testWinProbabilities(sks, validators, 10000);
+    }
+
+    SECTION("Random topology")
+    {
+        for (int i = 0; i < 10; ++i)
+        {
+            auto [sks, validators] = randomTopology(50);
+            testWinProbabilities(sks, validators, 10000);
+        }
+    }
+}
+
+// Returns a new `Topology` with the last org in `t` replaced with a new org
+// with 3 validators. Requires that the last org in `t` have 3 validators and be
+// contiguous at the back of the validators vecto.
+static Topology
+replaceOneOrg(Topology const& t)
+{
+    Topology t2(t); // Copy the topology
+    auto& [sks, validators] = t2;
+    REQUIRE(sks.size() == validators.size());
+
+    // Give the org a unique name
+    std::string const orgName = "org-replaced";
+
+    // Double check that the new org name is unique
+    for (ValidatorEntry const& v : validators)
+    {
+        REQUIRE(v.mHomeDomain != orgName);
+    }
+
+    // Remove the last org
+    constexpr int validatorsPerOrg = 3;
+    sks.resize(sks.size() - validatorsPerOrg);
+    validators.resize(validators.size() - validatorsPerOrg);
+
+    // Add new org with 3 validators
+    int constexpr numValidators = 3;
+    for (int j = 0; j < numValidators; ++j)
+    {
+        SecretKey const& key = sks.emplace_back(SecretKey::random());
+        ValidatorEntry& entry = validators.emplace_back();
+        entry.mName = fmt::format("validator-replaced-{}", j);
+        entry.mHomeDomain = orgName;
+        entry.mQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+        entry.mKey = key.getPublicKey();
+        entry.mHasHistory = false;
+    }
+
+    return {sks, validators};
+}
+
+// Add `orgsToAdd` new orgs to the topology `t`. Each org will have 3
+// validators.
+static Topology
+addOrgs(int orgsToAdd, Topology const& t)
+{
+    Topology t2(t); // Copy the topology
+    auto& [sks, validators] = t2;
+    REQUIRE(sks.size() == validators.size());
+
+    // Generate new orgs
+    for (int i = 0; i < orgsToAdd; ++i)
+    {
+        std::string const org = fmt::format("new-org-{}", i);
+        int constexpr numValidators = 3;
+        for (int j = 0; j < numValidators; ++j)
+        {
+            SecretKey const& key = sks.emplace_back(SecretKey::random());
+            ValidatorEntry& entry = validators.emplace_back();
+            entry.mName = fmt::format("new-validator-{}-{}", i, j);
+            entry.mHomeDomain = org;
+            entry.mQuality = ValidatorQuality::VALIDATOR_HIGH_QUALITY;
+            entry.mKey = key.getPublicKey();
+            entry.mHasHistory = false;
+        }
+    }
+    return t2;
+}
+
+// Returns `true` if the set intersection of `leaders1` and `leaders2` is not
+// empty.
+bool
+leadersIntersect(std::set<NodeID> const& leaders1,
+                 std::set<NodeID> const& leaders2)
+{
+    std::vector<NodeID> intersection;
+    std::set_intersection(leaders1.begin(), leaders1.end(), leaders2.begin(),
+                          leaders2.end(), std::back_inserter(intersection));
+    return !intersection.empty();
+}
+
+// Given two quorum sets consisting of validators in `validators1` and
+// `validators2`, this function returns the probability that the two quorum sets
+// will agree on a leader in the first round of nomination.
+double
+computeExpectedFirstRoundAgreementProbability(
+    std::vector<ValidatorEntry> const& validators1,
+    std::vector<ValidatorEntry> const& validators2)
+{
+    // Gather orgs
+    std::set<std::string> orgs1;
+    std::transform(validators1.begin(), validators1.end(),
+                   std::inserter(orgs1, orgs1.end()),
+                   [](ValidatorEntry const& v) { return v.mHomeDomain; });
+    std::set<std::string> orgs2;
+    std::transform(validators2.begin(), validators2.end(),
+                   std::inserter(orgs2, orgs2.end()),
+                   [](ValidatorEntry const& v) { return v.mHomeDomain; });
+
+    // Compute overlap
+    std::vector<std::string> sharedOrgs;
+    std::set_intersection(orgs1.begin(), orgs1.end(), orgs2.begin(),
+                          orgs2.end(), std::back_inserter(sharedOrgs));
+
+    // Probability of agreement in first round is (orgs overlapping / orgs1) *
+    // (orgs overlapping / orgs2). That's the probability that the two sides
+    // will pick any overlapping org. The algorithm guarantees that if they pick
+    // overlapping validator, they'll pick the same validator.
+    double overlap = static_cast<double>(sharedOrgs.size());
+    return overlap / orgs1.size() * overlap / orgs2.size();
+}
+
+// Test that the nomination algorithm behaves as expected when the two quorum
+// sets `qs1` and `qs2` are not equivalent. This function requires that both
+// quorum sets overlap, and contain only a single quality level of validators.
+// Runs simulation for `numLedgers` slots.
+// NOTE: This test counts any failure to agree on a leader as a timeout. In
+// practice, it's possible that one side of the split is large enough to proceed
+// without the other side. In this case, the larger side might not experience a
+// timeout and "drag" the other side through consensus with it. However, this
+// test aims to analyze the worst case scenario where the two sides are fairly
+// balanced and real-world networking conditions are in place (some nodes
+// lagging, etc), such that disagreement always results in a timeout.
+void
+testAsymmetricTimeouts(Topology const& qs1, Topology const& qs2,
+                       int const numLedgers)
+{
+    auto const& [sks1, validators1] = qs1;
+    auto const& [sks2, validators2] = qs2;
+
+    REQUIRE(sks1.size() == validators1.size());
+    REQUIRE(sks2.size() == validators2.size());
+
+    // Generate configs and nodes representing one validator with each quorum
+    // set
+    std::vector<VirtualClock> clocks(2);
+    std::vector<Application::pointer> apps;
+    for (int i = 0; i < 2; ++i)
+    {
+        Config cfg = getTestConfig(i);
+        cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+        cfg.generateQuorumSetForTesting(i == 0 ? validators1 : validators2);
+        cfg.NODE_SEED = i == 0 ? sks1.back() : sks2.back();
+
+        auto app = apps.emplace_back(createTestApplication(clocks.at(i), cfg));
+    }
+
+    // Run the nomination algorithm for `numLedgers` slots. Simulate timeouts by
+    // re-running slots that don't agree on a leader until their leader
+    // elections overlap. Record the number of timeouts it takes for the two
+    // quorum sets to agree on a leader in `timeouts`, which is effectively a
+    // mapping from number of timeouts to the number of ledgers that experienced
+    // that many timeouts.
+    std::vector<int> timeouts(std::max(validators1.size(), validators2.size()));
+    for (int i = 0; i < numLedgers; ++i)
+    {
+        Value const v = getRandomValue();
+        SCP& scp1 = dynamic_cast<HerderImpl&>(apps.at(0)->getHerder()).getSCP();
+        SCP& scp2 = dynamic_cast<HerderImpl&>(apps.at(1)->getHerder()).getSCP();
+        auto s1 = std::make_shared<Slot>(i, scp1);
+        auto s2 = std::make_shared<Slot>(i, scp2);
+
+        TestNominationProtocol np1(*s1);
+        TestNominationProtocol np2(*s2);
+
+        for (int j = 0; j < timeouts.size(); ++j)
+        {
+            std::set<NodeID> const& leaders1 =
+                np1.updateRoundLeadersForTesting(v);
+            std::set<NodeID> const& leaders2 =
+                np2.updateRoundLeadersForTesting(v);
+            REQUIRE(leaders1.size() == j + 1);
+            REQUIRE(leaders2.size() == j + 1);
+
+            if (leadersIntersect(leaders1, leaders2))
+            {
+                // Agreed on a leader! Record the number of timeouts resulted.
+                ++timeouts.at(j);
+                break;
+            }
+        }
+
+        // If leaders don't intersect after running through the loop then the
+        // two quorum sets have no overlap and the test is broken.
+        REQUIRE(leadersIntersect(np1.getLeaders(), np2.getLeaders()));
+    }
+
+    // For the first round, we can easily compute the expected agreement
+    // probability. For subsequent rounds, we check only that the success rate
+    // increases over time (modulo some small epsilon).
+    double expectedSuccessRate =
+        computeExpectedFirstRoundAgreementProbability(validators1, validators2);
+
+    // Allow for some small decrease in success rate from the theoretical value.
+    // We're working with probabilistic simulation here so we can't be too
+    // strict or the test will be flaky.
+    double constexpr epsilon = 0.1;
+
+    // There's not enough data in the tail of the distribution to allow us to
+    // assert that the success rate is what's expected. To avoid sporadic test
+    // failures, we cut off `tailCutoffPoint` of the tail of the distribution
+    // for the purposes of asserting test values. However, the test will still
+    // log those success rates for manual examination.
+    double constexpr tailCutoffPoint = 0.05;
+
+    int numLedgersRemaining = numLedgers;
+    for (int i = 0; i < timeouts.size(); ++i)
+    {
+        int const numTimeouts = timeouts.at(i);
+        if (numTimeouts == 0)
+        {
+            // Avoid cluttering output
+            continue;
+        }
+
+        CLOG_INFO(Herder, "Ledgers with {} timeouts: {} ({}%)", i, numTimeouts,
+                  static_cast<double>(numTimeouts) * 100 / numLedgers);
+
+        if (numLedgersRemaining > numLedgers * tailCutoffPoint)
+        {
+            // Check that success rate increases over time. Allow some epsilon
+            // decrease because this is a probabilistic simulation. Also stop
+            // checking when we're at the last `tailCutoffPoint` timeouts as the
+            // data is too sparse to be useful.
+            double successRate =
+                static_cast<double>(timeouts.at(i)) / numLedgersRemaining;
+            REQUIRE(successRate > expectedSuccessRate - epsilon);
+
+            // Take max of success rate and previous success rate to avoid
+            // accidentally accepting a declining success rate due to episilon.
+            expectedSuccessRate = std::max(successRate, expectedSuccessRate);
+            numLedgersRemaining -= numTimeouts;
+        }
+    }
+}
+
+// Test timeouts with asymmetric quorums. This test serves two purposes:
+// 1. It contains assertions checking for moderate (10%) deviations from the
+//    expected behavior of the nomination algorithm. These should detect any
+//    major issues/regressions with the algorithm.
+// 2. It logs the distributions of timeouts for manual inspection. This is
+//    useful for understanding the behavior of the algorithm and for testing
+//    specific scenarios one might be interested in (e.g., if tier 1 disagrees
+//    on one org's presence in tier 1, what is the impact on nomination
+//    timeouts?).
+// NOTE: This provides a worst-case analysis of timeouts. See the NOTE on
+// `testAsymmetricTimeouts` for more details.
+TEST_CASE("Asymmetric quorum timeouts", "[herder]")
+{
+    // Number of slots to run for
+    int constexpr numLedgers = 20000;
+
+    SECTION("Tier 1-like topology with replaced org")
+    {
+        auto t = teir1Like();
+        testAsymmetricTimeouts(t, replaceOneOrg(t), numLedgers);
+    }
+
+    SECTION("Tier 1-like topology with 1 added org")
+    {
+        auto t = teir1Like();
+        testAsymmetricTimeouts(t, addOrgs(1, t), numLedgers);
+    }
+
+    SECTION("Tier 1-like topology with 3 added orgs")
+    {
+        auto t = teir1Like();
+        testAsymmetricTimeouts(t, addOrgs(3, t), numLedgers);
+    }
+}
+
+// Test that the nomination algorithm behaves as expected when a random
+// `numUnresponsive` set of nodes in `qs` are unresponsive.  Runs simulation for
+// `numLedgers` slots.
+void
+testUnresponsiveTimeouts(Topology const& qs, int numUnresponsive,
+                         int const numLedgers)
+{
+    auto const& [sks, validators] = qs;
+    REQUIRE(sks.size() == validators.size());
+    REQUIRE(numUnresponsive < validators.size());
+
+    // extract and shuffle node ids. Choose `numUnresponsive` nodes to be the
+    // unresponsive nodes.
+    std::vector<NodeID> nodeIDs;
+    std::transform(validators.begin(), validators.end(),
+                   std::back_inserter(nodeIDs),
+                   [](ValidatorEntry const& v) { return v.mKey; });
+    stellar::shuffle(nodeIDs.begin(), nodeIDs.end(), gRandomEngine);
+    std::set<NodeID> unresponsive(nodeIDs.begin(),
+                                  nodeIDs.begin() + numUnresponsive);
+
+    // Collect info about orgs
+    ValidatorQuality maxQuality;
+    std::unordered_map<std::string, ValidatorQuality> orgQualities;
+    std::unordered_map<std::string, int> orgSizes;
+    std::unordered_map<ValidatorQuality, uint64> orgQualityCounts;
+    collectOrgInfo(maxQuality, orgQualities, orgSizes, orgQualityCounts,
+                   validators);
+
+    // Compute total weight of all validators, as well as the total weight of
+    // unresponsive validators
+    double totalWeight = 0.0;
+    double unresponsiveWeight = 0.0;
+    for (ValidatorEntry const& validator : validators)
+    {
+        double normalizedWeight =
+            expectedNormalizedWeight(orgQualityCounts, maxQuality,
+                                     orgQualities.at(validator.mHomeDomain),
+                                     orgSizes.at(validator.mHomeDomain));
+        totalWeight += normalizedWeight;
+        if (unresponsive.count(validator.mKey))
+        {
+            unresponsiveWeight += normalizedWeight;
+        }
+    }
+
+    // Compute the average weight of an unresponsive node
+    double avgUnresponsiveWeight = unresponsiveWeight / numUnresponsive;
+
+    // Compute expected number of ledgers experiencing `n` timeouts where `n` is
+    // the index of the `timeouts` vector. This vector is a mapping from number
+    // of timeouts to expected number of ledgers experiencing that number of
+    // timeouts.
+    std::vector<int> expectedTimeouts(numUnresponsive + 1);
+    double remainingWeight = totalWeight;
+    int remainingUnresponsive = numUnresponsive;
+    int remainingLedgers = numLedgers;
+    for (int i = 0; i < expectedTimeouts.size(); ++i)
+    {
+        double timeoutProb =
+            (avgUnresponsiveWeight * remainingUnresponsive) / remainingWeight;
+        // To get expected number of ledgers experiencing `i` timeouts, we take
+        // the probability a timeout does not occur and multiply it by the
+        // number of remaining ledgers.
+        int expectedLedgers = (1 - timeoutProb) * remainingLedgers;
+        expectedTimeouts.at(i) = expectedLedgers;
+
+        // Remaining ledgers decreases by expected number of ledgers
+        // experiencing `i` timeouts
+        remainingLedgers -= expectedLedgers;
+
+        // For `i+1` timeouts to occur, an unresponsive node must be chosen.
+        // Therefore, deduct the average weight of an unresponsive node from the
+        // total weight left in the network.
+        remainingWeight -= avgUnresponsiveWeight;
+        --remainingUnresponsive;
+    }
+
+    // Generate a config
+    Config cfg = getTestConfig();
+    cfg.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+    cfg.generateQuorumSetForTesting(validators);
+    cfg.NODE_SEED = sks.front();
+
+    // Create an application
+    VirtualClock clock;
+    Application::pointer app = createTestApplication(clock, cfg);
+
+    // Run for `numLedgers` slots, recording the number of times each slot timed
+    // out due to unresponsive nodes before successfully electing a responsive
+    // leader.
+    SCP& scp = dynamic_cast<HerderImpl&>(app->getHerder()).getSCP();
+    std::vector<int> timeouts(numUnresponsive + 1);
+    for (int i = 0; i < numLedgers; ++i)
+    {
+        Value const v = getRandomValue();
+        auto s = std::make_shared<Slot>(i, scp);
+
+        TestNominationProtocol np(*s);
+        for (int i = 0; i < timeouts.size(); ++i)
+        {
+            std::set<NodeID> const& leaders =
+                np.updateRoundLeadersForTesting(v);
+            // If leaders is a subset of unresponsive, then a timeout occurs.
+            if (!std::includes(unresponsive.begin(), unresponsive.end(),
+                               leaders.begin(), leaders.end()))
+            {
+                ++timeouts.at(i);
+                break;
+            }
+        }
+    }
+
+    // Allow for some small multiplicative increase in timeouts from the
+    // theoretical value.  We're working with probabilistic simulation here so
+    // we can't be too strict or the test will be flaky.
+    double constexpr epsilon = 1.1;
+
+    // There's not enough data in the tail of the distribution to allow us to
+    // assert that the timeout values are what's expected. To avoid sporadic
+    // test failures, we cut off `tailCutoffPoint` of the tail of the
+    // distribution for the purposes of asserting test values. However, the test
+    // will still log those values for manual examination.
+    double constexpr tailCutoffPoint = 0.05;
+
+    // Analyze timeouts
+    int numLedgersRemaining = numLedgers;
+    for (int i = 0; i < timeouts.size(); ++i)
+    {
+        int const numTimeouts = timeouts.at(i);
+        int const expectedNumTimeouts = expectedTimeouts.at(i);
+
+        if (numLedgersRemaining > numLedgers * tailCutoffPoint)
+        {
+            // Check that timeouts are less than epsilon times the expected
+            // value. Also stop checking when we're at the last
+            // `tailCutoffPoint` timeouts as the data is too sparse to be
+            // useful.
+            REQUIRE(numTimeouts < expectedNumTimeouts * epsilon);
+        }
+        CLOG_INFO(Herder, "Ledgers with {} timeouts: {} ({}%)", i, numTimeouts,
+                  numTimeouts * 100.0 / numLedgers);
+        numLedgersRemaining -= numTimeouts;
+    }
+}
+
+// Test timeouts for a tier 1-like topology with 1-5 unresponsive nodes. This
+// test serves two purposes:
+// 1. It contains assertions checking for moderate (10%) deviations from the
+//    expected behavior of the nomination algorithm. These should detect any
+//    major issues/regressions with the algorithm.
+// 2. It logs the distributions of timeouts for manual inspection. This is
+//    useful for understanding the behavior of the algorithm and for testing
+//    specific scenarios one might be interested in (e.g., if 3 tier 1 nodes
+//    are heavily lagging, what is the impact on nomination timeouts?).
+TEST_CASE("Unresponsive quorum timeouts", "[herder]")
+{
+    // Number of slots to run for
+    int constexpr numLedgers = 20000;
+
+    auto t = teir1Like();
+    for (int i = 1; i <= 5; ++i)
+    {
+        CLOG_INFO(Herder, "Simulating nomination with {} unresponsive nodes",
+                  i);
+        testUnresponsiveTimeouts(t, i, numLedgers);
+    }
 }

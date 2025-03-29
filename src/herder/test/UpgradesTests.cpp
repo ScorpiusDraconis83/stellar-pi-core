@@ -3,9 +3,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/BucketInputIterator.h"
-#include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
-#include "bucket/BucketManagerImpl.h"
+#include "bucket/LiveBucketList.h"
 #include "bucket/test/BucketTestUtils.h"
 #include "crypto/Random.h"
 #include "herder/Herder.h"
@@ -22,7 +21,6 @@
 #include "ledger/TrustLineWrapper.h"
 #include "lib/catch.hpp"
 #include "simulation/Simulation.h"
-#include "simulation/Topologies.h"
 #include "test/TestExceptions.h"
 #include "test/TestMarket.h"
 #include "test/TestUtils.h"
@@ -253,7 +251,7 @@ makeBucketListSizeWindowSampleSizeTestUpgrade(Application& app,
 {
     // Modify window size
     auto sas = app.getLedgerManager()
-                   .getSorobanNetworkConfig()
+                   .getLastClosedSorobanNetworkConfig()
                    .stateArchivalSettings();
     sas.bucketListSizeWindowSampleSize = newWindowSize;
 
@@ -282,6 +280,29 @@ getBucketListSizeWindowKey()
         CONFIG_SETTING_BUCKETLIST_SIZE_WINDOW;
     return windowKey;
 }
+
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+LedgerKey
+getParallelComputeSettingsLedgerKey()
+{
+    LedgerKey maxContractSizeKey(CONFIG_SETTING);
+    maxContractSizeKey.configSetting().configSettingID =
+        CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0;
+    return maxContractSizeKey;
+}
+
+ConfigUpgradeSetFrameConstPtr
+makeParallelComputeUpdgrade(AbstractLedgerTxn& ltx,
+                            uint32_t maxDependentTxClusters)
+{
+    ConfigUpgradeSet configUpgradeSet;
+    auto& configEntry = configUpgradeSet.updatedEntry.emplace_back();
+    configEntry.configSettingID(CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0);
+    configEntry.contractParallelCompute().ledgerMaxDependentTxClusters =
+        maxDependentTxClusters;
+    return makeConfigUpgradeSet(ltx, configUpgradeSet);
+}
+#endif
 
 void
 testListUpgrades(VirtualClock::system_time_point preferredUpgradeDatetime,
@@ -374,7 +395,7 @@ void
 testValidateUpgrades(VirtualClock::system_time_point preferredUpgradeDatetime,
                      bool canBeValid)
 {
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION = 10;
     cfg.TESTING_UPGRADE_DESIRED_FEE = 100;
     cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 50;
@@ -632,7 +653,7 @@ TEST_CASE("Ledger Manager applies upgrades properly", "[upgrades]")
 TEST_CASE("config upgrade validation", "[upgrades]")
 {
     VirtualClock clock;
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     auto app = createTestApplication(clock, cfg);
 
     auto headerTime = VirtualClock::to_time_t(genesis(0, 2));
@@ -825,10 +846,67 @@ TEST_CASE("config upgrade validation", "[upgrades]")
     }
 }
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+TEST_CASE("config upgrade validation for protocol 23", "[upgrades]")
+{
+    auto runTest = [&](uint32_t protocolVersion, uint32_t clusterCount) {
+        VirtualClock clock;
+        auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
+        auto app = createTestApplication(clock, cfg);
+
+        LedgerHeader header;
+        auto headerTime = VirtualClock::to_time_t(genesis(0, 2));
+        header.ledgerVersion = protocolVersion;
+        header.scpValue.closeTime = headerTime;
+
+        ConfigUpgradeSetFrameConstPtr configUpgradeSet;
+
+        {
+            Upgrades::UpgradeParameters scheduledUpgrades;
+            LedgerTxn ltx(app->getLedgerTxnRoot());
+            configUpgradeSet = makeParallelComputeUpdgrade(ltx, clusterCount);
+
+            scheduledUpgrades.mUpgradeTime = genesis(0, 1);
+            scheduledUpgrades.mConfigUpgradeSetKey = configUpgradeSet->getKey();
+            app->getHerder().setUpgrades(scheduledUpgrades);
+            ltx.commit();
+        }
+        LedgerTxn ltx(app->getLedgerTxnRoot());
+        ltx.loadHeader().current() = header;
+        auto ls = LedgerSnapshot(ltx);
+        LedgerUpgrade outUpgrade;
+        return Upgrades::isValidForApply(
+            toUpgradeType(makeConfigUpgrade(*configUpgradeSet)), outUpgrade,
+            *app, ls);
+    };
+
+    SECTION("valid for apply")
+    {
+        REQUIRE(runTest(static_cast<uint32_t>(
+                            PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION),
+                        10) == Upgrades::UpgradeValidity::VALID);
+    }
+
+    SECTION("unsupported protocol")
+    {
+        REQUIRE(runTest(static_cast<uint32_t>(
+                            PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION) -
+                            1,
+                        10) == Upgrades::UpgradeValidity::INVALID);
+    }
+    SECTION("0 clusters")
+    {
+        REQUIRE(runTest(static_cast<uint32_t>(
+                            PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION),
+                        0) == Upgrades::UpgradeValidity::INVALID);
+    }
+}
+#endif
+
 TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
 {
     VirtualClock clock;
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     cfg.TESTING_UPGRADE_LEDGER_PROTOCOL_VERSION =
         static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION) - 1;
     cfg.USE_CONFIG_FOR_GENESIS = false;
@@ -839,7 +917,7 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
     executeUpgrade(*app, makeProtocolVersionUpgrade(
                              static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION)));
     auto const& sorobanConfig =
-        app->getLedgerManager().getSorobanNetworkConfig();
+        app->getLedgerManager().getLastClosedSorobanNetworkConfig();
     SECTION("unknown config upgrade set is ignored")
     {
         auto contractID = autocheck::generator<Hash>()(5);
@@ -880,8 +958,8 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
             ConfigUpgradeSetFrameConstPtr configUpgradeSet;
             {
                 LedgerTxn ltx2(app->getLedgerTxnRoot());
-                auto& cfg =
-                    app->getLedgerManager().getMutableSorobanNetworkConfig();
+                auto& cfg = app->getLedgerManager()
+                                .getMutableSorobanNetworkConfigForApply();
 
                 // Populate sliding window with interesting values
                 auto i = 0;
@@ -907,7 +985,7 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
             auto const newSize = 20;
             populateValuesAndUpgradeSize(newSize);
             auto const& cfg2 =
-                app->getLedgerManager().getSorobanNetworkConfig();
+                app->getLedgerManager().getLastClosedSorobanNetworkConfig();
 
             // Verify that we popped the 10 oldest values
             auto sum = 0;
@@ -929,7 +1007,7 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
             auto const newSize = 40;
             populateValuesAndUpgradeSize(newSize);
             auto const& cfg2 =
-                app->getLedgerManager().getSorobanNetworkConfig();
+                app->getLedgerManager().getLastClosedSorobanNetworkConfig();
 
             // Verify that we backfill 10 copies of the oldest value
             auto sum = 0;
@@ -959,7 +1037,7 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
                 LedgerTxn ltx2(app->getLedgerTxnRoot());
 
                 auto const& cfg =
-                    app->getLedgerManager().getSorobanNetworkConfig();
+                    app->getLedgerManager().getLastClosedSorobanNetworkConfig();
                 initialSize =
                     cfg.mStateArchivalSettings.bucketListSizeWindowSampleSize;
                 initialWindow = cfg.mBucketListSizeSnapshots;
@@ -974,7 +1052,8 @@ TEST_CASE("config upgrades applied to ledger", "[soroban][upgrades]")
             REQUIRE(configUpgradeSet);
             executeUpgrade(*app, makeConfigUpgrade(*configUpgradeSet));
 
-            auto const& cfg = app->getLedgerManager().getSorobanNetworkConfig();
+            auto const& cfg =
+                app->getLedgerManager().getLastClosedSorobanNetworkConfig();
             REQUIRE(cfg.mStateArchivalSettings.bucketListSizeWindowSampleSize ==
                     initialSize);
             REQUIRE(cfg.mBucketListSizeSnapshots == initialWindow);
@@ -1088,7 +1167,7 @@ TEST_CASE("Soroban max tx set size upgrade applied to ledger",
                              static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION)));
 
     auto const& sorobanConfig =
-        app->getLedgerManager().getSorobanNetworkConfig();
+        app->getLedgerManager().getLastClosedSorobanNetworkConfig();
 
     executeUpgrade(*app, makeMaxSorobanTxSizeUpgrade(123));
     REQUIRE(sorobanConfig.ledgerMaxTxCount() == 123);
@@ -1671,8 +1750,9 @@ TEST_CASE("upgrade to version 10", "[upgrades]")
                     " offers that do not satisfy thresholds")
             {
                 // Pay txFee to send 4*baseReserve + 3*txFee for net balance
-                // decrease of 4*baseReserve + 4*txFee. This matches the balance
-                // decrease from creating 4 offers as in the next test section.
+                // decrease of 4*baseReserve + 4*txFee. This matches the
+                // balance decrease from creating 4 offers as in the next
+                // test section.
                 a1.pay(root, 4 * lm.getLastReserve() + 3 * txFee);
 
                 std::vector<TestMarketOffer> offers;
@@ -1809,8 +1889,9 @@ TEST_CASE("upgrade to version 10", "[upgrades]")
                     " unauthorized offers")
             {
                 // Pay txFee to send 4*baseReserve + 3*txFee for net balance
-                // decrease of 4*baseReserve + 4*txFee. This matches the balance
-                // decrease from creating 4 offers as in the next test section.
+                // decrease of 4*baseReserve + 4*txFee. This matches the
+                // balance decrease from creating 4 offers as in the next
+                // test section.
                 a1.pay(root, 4 * lm.getLastReserve() + 3 * txFee);
 
                 std::vector<TestMarketOffer> offers;
@@ -1959,11 +2040,10 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
         uint64_t minBalance = lm.getLastMinBalance(5);
         uint64_t big = minBalance + ledgerSeq;
         uint64_t closeTime = 60 * 5 * ledgerSeq;
-        auto txSet = makeTxSetFromTransactions(
-                         TxSetTransactions{
-                             root.tx({txtest::createAccount(stranger, big)})},
-                         *app, 0, 0)
-                         .first;
+        auto txSet =
+            makeTxSetFromTransactions(
+                {root.tx({txtest::createAccount(stranger, big)})}, *app, 0, 0)
+                .first;
 
         // On 4th iteration of advance (a.k.a. ledgerSeq 5), perform a
         // ledger-protocol version upgrade to the new protocol, to activate
@@ -1982,9 +2062,9 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
         StellarValue sv = app->getHerder().makeStellarValue(
             txSet->getContentsHash(), closeTime, upgrades,
             app->getConfig().NODE_SEED);
-        lm.closeLedger(LedgerCloseData(ledgerSeq, txSet, sv));
+        lm.applyLedger(LedgerCloseData(ledgerSeq, txSet, sv));
         auto& bm = app->getBucketManager();
-        auto& bl = bm.getBucketList();
+        auto& bl = bm.getLiveBucketList();
         while (!bl.futuresAllResolved())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1998,16 +2078,17 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
                   ledgerSeq, mc.mPreInitEntryProtocolMerges,
                   mc.mPostInitEntryProtocolMerges, mc.mNewInitEntries,
                   mc.mOldInitEntries);
-        for (uint32_t level = 0; level < BucketList::kNumLevels; ++level)
+        for (uint32_t level = 0; level < LiveBucketList::kNumLevels; ++level)
         {
-            auto& lev = bm.getBucketList().getLevel(level);
+            auto& lev = bm.getLiveBucketList().getLevel(level);
             BucketTestUtils::EntryCounts currCounts(lev.getCurr());
             BucketTestUtils::EntryCounts snapCounts(lev.getSnap());
             CLOG_INFO(
                 Bucket,
                 "post-ledger {} close, init counts: level {}, {} in curr, "
                 "{} in snap",
-                ledgerSeq, level, currCounts.nInit, snapCounts.nInit);
+                ledgerSeq, level, currCounts.nInitOrArchived,
+                snapCounts.nInitOrArchived);
         }
         if (ledgerSeq < 5)
         {
@@ -2022,16 +2103,16 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
             // Check several subtle characteristics of the post-upgrade
             // environment:
             //   - Old-protocol merges stop happening (there should have
-            //     been 6 before the upgrade, but we re-use a merge we did at
-            //     ledger 1 for ledger 2 spill, so the counter is at 5)
+            //     been 6 before the upgrade, but we re-use a merge we did
+            //     at ledger 1 for ledger 2 spill, so the counter is at 5)
             //   - New-protocol merges start happening.
             //   - At the upgrade (5), we find 1 INITENTRY in lev[0].curr
             //   - The next two (6, 7), propagate INITENTRYs to lev[0].snap
             //   - From 8 on, the INITENTRYs propagate to lev[1].curr
             REQUIRE(mc.mPreInitEntryProtocolMerges == 5);
             REQUIRE(mc.mPostInitEntryProtocolMerges != 0);
-            auto& lev0 = bm.getBucketList().getLevel(0);
-            auto& lev1 = bm.getBucketList().getLevel(1);
+            auto& lev0 = bm.getLiveBucketList().getLevel(0);
+            auto& lev1 = bm.getLiveBucketList().getLevel(1);
             auto lev0Curr = lev0.getCurr();
             auto lev0Snap = lev0.getSnap();
             auto lev1Curr = lev1.getCurr();
@@ -2039,22 +2120,22 @@ TEST_CASE("upgrade to version 11", "[upgrades]")
             BucketTestUtils::EntryCounts lev0CurrCounts(lev0Curr);
             BucketTestUtils::EntryCounts lev0SnapCounts(lev0Snap);
             BucketTestUtils::EntryCounts lev1CurrCounts(lev1Curr);
-            auto getVers = [](std::shared_ptr<Bucket> b) -> uint32_t {
-                return BucketInputIterator(b).getMetadata().ledgerVersion;
+            auto getVers = [](std::shared_ptr<LiveBucket> b) -> uint32_t {
+                return LiveBucketInputIterator(b).getMetadata().ledgerVersion;
             };
             switch (ledgerSeq)
             {
             default:
             case 8:
                 REQUIRE(getVers(lev1Curr) == newProto);
-                REQUIRE(lev1CurrCounts.nInit != 0);
+                REQUIRE(lev1CurrCounts.nInitOrArchived != 0);
             case 7:
             case 6:
                 REQUIRE(getVers(lev0Snap) == newProto);
-                REQUIRE(lev0SnapCounts.nInit != 0);
+                REQUIRE(lev0SnapCounts.nInitOrArchived != 0);
             case 5:
                 REQUIRE(getVers(lev0Curr) == newProto);
-                REQUIRE(lev0CurrCounts.nInit != 0);
+                REQUIRE(lev0CurrCounts.nInitOrArchived != 0);
             }
         }
     }
@@ -2085,9 +2166,7 @@ TEST_CASE("upgrade to version 12", "[upgrades]")
         uint64_t closeTime = 60 * 5 * ledgerSeq;
         TxSetXDRFrameConstPtr txSet =
             makeTxSetFromTransactions(
-                TxSetTransactions{
-                    root.tx({txtest::createAccount(stranger, big)})},
-                *app, 0, 0)
+                {root.tx({txtest::createAccount(stranger, big)})}, *app, 0, 0)
                 .first;
 
         // On 4th iteration of advance (a.k.a. ledgerSeq 5), perform a
@@ -2106,9 +2185,9 @@ TEST_CASE("upgrade to version 12", "[upgrades]")
         StellarValue sv = app->getHerder().makeStellarValue(
             txSet->getContentsHash(), closeTime, upgrades,
             app->getConfig().NODE_SEED);
-        lm.closeLedger(LedgerCloseData(ledgerSeq, txSet, sv));
+        lm.applyLedger(LedgerCloseData(ledgerSeq, txSet, sv));
         auto& bm = app->getBucketManager();
-        auto& bl = bm.getBucketList();
+        auto& bl = bm.getLiveBucketList();
         while (!bl.futuresAllResolved())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2122,14 +2201,14 @@ TEST_CASE("upgrade to version 12", "[upgrades]")
         }
         else
         {
-            auto& lev0 = bm.getBucketList().getLevel(0);
-            auto& lev1 = bm.getBucketList().getLevel(1);
+            auto& lev0 = bm.getLiveBucketList().getLevel(0);
+            auto& lev1 = bm.getLiveBucketList().getLevel(1);
             auto lev0Curr = lev0.getCurr();
             auto lev0Snap = lev0.getSnap();
             auto lev1Curr = lev1.getCurr();
             auto lev1Snap = lev1.getSnap();
-            auto getVers = [](std::shared_ptr<Bucket> b) -> uint32_t {
-                return BucketInputIterator(b).getMetadata().ledgerVersion;
+            auto getVers = [](std::shared_ptr<LiveBucket> b) -> uint32_t {
+                return LiveBucketInputIterator(b).getMetadata().ledgerVersion;
             };
             switch (ledgerSeq)
             {
@@ -2138,8 +2217,8 @@ TEST_CASE("upgrade to version 12", "[upgrades]")
                 REQUIRE(getVers(lev1Snap) == oldProto);
                 REQUIRE(mc.mPostShadowRemovalProtocolMerges == 6);
                 // One more old-style merge despite the upgrade
-                // At ledger 8, level 2 spills, and starts an old-style merge,
-                // as level 1 snap is still of old version
+                // At ledger 8, level 2 spills, and starts an old-style
+                // merge, as level 1 snap is still of old version
                 REQUIRE(mc.mPreShadowRemovalProtocolMerges == 6);
                 break;
             case 7:
@@ -2233,7 +2312,7 @@ TEST_CASE("configuration initialized in version upgrade", "[upgrades]")
         REQUIRE(!ltx.load(getMaxContractSizeKey()));
     }
 
-    auto blSize = app->getBucketManager().getBucketList().getSize();
+    auto blSize = app->getBucketManager().getLiveBucketList().getSize();
     executeUpgrade(*app, makeProtocolVersionUpgrade(
                              static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION)));
 
@@ -2246,7 +2325,8 @@ TEST_CASE("configuration initialized in version upgrade", "[upgrades]")
             InitialSorobanNetworkConfig::MAX_CONTRACT_SIZE);
 
     // Check that BucketList size window initialized with current BL size
-    auto& networkConfig = app->getLedgerManager().getSorobanNetworkConfig();
+    auto& networkConfig =
+        app->getLedgerManager().getLastClosedSorobanNetworkConfig();
     REQUIRE(networkConfig.getAverageBucketListSize() == blSize);
 
     // Check in memory window
@@ -2271,11 +2351,82 @@ TEST_CASE("configuration initialized in version upgrade", "[upgrades]")
     }
 }
 
+#ifdef ENABLE_NEXT_PROTOCOL_VERSION_UNSAFE_FOR_PRODUCTION
+TEST_CASE("parallel Soroban settings upgrade", "[upgrades]")
+{
+    VirtualClock clock;
+    auto cfg = getTestConfig(0, Config::TestDbMode::TESTDB_IN_MEMORY);
+    cfg.USE_CONFIG_FOR_GENESIS = false;
+
+    auto app = createTestApplication(clock, cfg);
+
+    executeUpgrade(*app,
+                   makeProtocolVersionUpgrade(
+                       static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION) - 1));
+
+    for (uint32_t version = static_cast<uint32_t>(SOROBAN_PROTOCOL_VERSION);
+         version <
+         static_cast<uint32_t>(PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION);
+         ++version)
+    {
+        executeUpgrade(*app, makeProtocolVersionUpgrade(version));
+    }
+
+    {
+        LedgerSnapshot ls(*app);
+        REQUIRE(!ls.load(getParallelComputeSettingsLedgerKey()));
+    }
+
+    executeUpgrade(*app, makeProtocolVersionUpgrade(static_cast<uint32_t>(
+                             PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION)));
+
+    // Make sure initial value is correct.
+    {
+        LedgerSnapshot ls(*app);
+        auto parellelComputeEntry =
+            ls.load(getParallelComputeSettingsLedgerKey())
+                .current()
+                .data.configSetting();
+        REQUIRE(parellelComputeEntry.configSettingID() ==
+                CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0);
+        REQUIRE(parellelComputeEntry.contractParallelCompute()
+                    .ledgerMaxDependentTxClusters ==
+                InitialSorobanNetworkConfig::LEDGER_MAX_DEPENDENT_TX_CLUSTERS);
+
+        // Check that BucketList size window initialized with current BL
+        // size
+        auto const& networkConfig =
+            app->getLedgerManager().getLastClosedSorobanNetworkConfig();
+        REQUIRE(networkConfig.ledgerMaxDependentTxClusters() ==
+                InitialSorobanNetworkConfig::LEDGER_MAX_DEPENDENT_TX_CLUSTERS);
+    }
+
+    // Execute an upgrade.
+    {
+        LedgerTxn ltx(app->getLedgerTxnRoot());
+        auto configUpgradeSet = makeParallelComputeUpdgrade(ltx, 5);
+        ltx.commit();
+        executeUpgrade(*app, makeConfigUpgrade(*configUpgradeSet));
+    }
+
+    LedgerSnapshot ls(*app);
+
+    REQUIRE(ls.load(getParallelComputeSettingsLedgerKey())
+                .current()
+                .data.configSetting()
+                .contractParallelCompute()
+                .ledgerMaxDependentTxClusters == 5);
+    REQUIRE(app->getLedgerManager()
+                .getLastClosedSorobanNetworkConfig()
+                .ledgerMaxDependentTxClusters() == 5);
+}
+#endif
+
 TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
 {
     VirtualClock clock;
 
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     auto app = createTestApplication(clock, cfg);
 
     auto& lm = app->getLedgerManager();
@@ -2433,8 +2584,9 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
         auto submitTx = [&](TransactionTestFramePtr tx) {
             LedgerTxn ltx(app->getLedgerTxnRoot());
             TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
-            REQUIRE(tx->checkValidForTesting(*app, ltx, 0, 0, 0));
-            REQUIRE(tx->apply(*app, ltx, txm));
+            REQUIRE(
+                tx->checkValidForTesting(app->getAppConnector(), ltx, 0, 0, 0));
+            REQUIRE(tx->apply(app->getAppConnector(), ltx, txm));
             ltx.commit();
 
             REQUIRE(tx->getResultCode() == txSUCCESS);
@@ -2547,8 +2699,9 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
                 createOffers(sponsoredAcc, offers, sponsoredAccPullOffers);
                 createOffers(sponsoredAcc2, offers, true);
 
-                // prepare ops to transfer sponsorship of all sponsoredAcc
-                // offers and one offer from sponsoredAcc2 to sponsoringAcc
+                // prepare ops to transfer sponsorship of all
+                // sponsoredAcc offers and one offer from sponsoredAcc2
+                // to sponsoringAcc
                 std::vector<Operation> ops = {
                     sponsoringAcc.op(
                         beginSponsoringFutureReserves(sponsoredAcc)),
@@ -2585,15 +2738,17 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
 
                 if (sponsoredAccPullOffers)
                 {
-                    // SponsoringAcc is now sponsoring all 12 of sponsoredAcc's
-                    // offers. SponsoredAcc has 4 subentries. It also has enough
-                    // lumens to cover 12 more subentries after the sponsorship
-                    // update. After the upgrade to double the baseReserve, this
-                    // account will need to cover the 4 subEntries, so we only
-                    // need 4 extra baseReserves before the upgrade. Pay out the
-                    // rest (8 reserves) so we can get our orders pulled on
-                    // upgrade. 16(total reserves) - 4(subEntries) -
-                    // 4(base reserve increase) = 8(extra base reserves)
+                    // SponsoringAcc is now sponsoring all 12 of
+                    // sponsoredAcc's offers. SponsoredAcc has 4
+                    // subentries. It also has enough lumens to cover 12
+                    // more subentries after the sponsorship update.
+                    // After the upgrade to double the baseReserve, this
+                    // account will need to cover the 4 subEntries, so
+                    // we only need 4 extra baseReserves before the
+                    // upgrade. Pay out the rest (8 reserves) so we can
+                    // get our orders pulled on upgrade. 16(total
+                    // reserves) - 4(subEntries) - 4(base reserve
+                    // increase) = 8(extra base reserves)
 
                     sponsoredAcc.pay(root, baseReserve * 8);
                 }
@@ -2607,8 +2762,8 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
                     sponsoringAcc.pay(root, 1);
                 }
 
-                // This account needs to lose a base reserve to get its orders
-                // pulled
+                // This account needs to lose a base reserve to get its
+                // orders pulled
                 sponsoredAcc2.pay(root, baseReserve);
 
                 // execute upgrade
@@ -2677,8 +2832,8 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
                     root.create(sponsoredSeed,
                                 lm.getLastMinBalance(14) + 3999 + 15 * txFee);
 
-                // This account will have one sponsored offer and will always
-                // have it's offers pulled.
+                // This account will have one sponsored offer and will
+                // always have it's offers pulled.
                 auto sponsored2 = root.create(
                     "C", 2 * lm.getLastMinBalance(13) + 3999 + 15 * txFee);
 
@@ -2706,8 +2861,8 @@ TEST_CASE_VERSIONS("upgrade base reserve", "[upgrades]")
             };
 
             for_versions_from(14, *app, [&] {
-                // Swap the seeds to test that the ordering of accounts doesn't
-                // matter when upgrading
+                // Swap the seeds to test that the ordering of accounts
+                // doesn't matter when upgrading
                 SECTION("account A is sponsored")
                 {
                     sponsorshipTestsBySeed("B", "A");
@@ -2974,7 +3129,7 @@ TEST_CASE("upgrade from cpp14 serialized data", "[upgrades]")
 
 TEST_CASE("upgrades serialization roundtrip", "[upgrades]")
 {
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
     VirtualClock clock;
     auto app = createTestApplication(clock, cfg);
 
@@ -3058,7 +3213,7 @@ TEST_CASE("upgrades serialization roundtrip", "[upgrades]")
 TEST_CASE_VERSIONS("upgrade flags", "[upgrades][liquiditypool]")
 {
     VirtualClock clock;
-    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
 
     auto app = createTestApplication(clock, cfg);
 

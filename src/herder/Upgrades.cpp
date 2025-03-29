@@ -690,66 +690,22 @@ Upgrades::timeForUpgrade(uint64_t time) const
 void
 Upgrades::dropAll(Database& db)
 {
-    db.getSession() << "DROP TABLE IF EXISTS upgradehistory";
-    db.getSession() << "CREATE TABLE upgradehistory ("
-                       "ledgerseq    INT NOT NULL CHECK (ledgerseq >= 0), "
-                       "upgradeindex INT NOT NULL, "
-                       "upgrade      TEXT NOT NULL, "
-                       "changes      TEXT NOT NULL, "
-                       "PRIMARY KEY (ledgerseq, upgradeindex)"
-                       ")";
-    db.getSession()
+    db.getRawSession() << "DROP TABLE IF EXISTS upgradehistory";
+    db.getRawSession() << "CREATE TABLE upgradehistory ("
+                          "ledgerseq    INT NOT NULL CHECK (ledgerseq >= 0), "
+                          "upgradeindex INT NOT NULL, "
+                          "upgrade      TEXT NOT NULL, "
+                          "changes      TEXT NOT NULL, "
+                          "PRIMARY KEY (ledgerseq, upgradeindex)"
+                          ")";
+    db.getRawSession()
         << "CREATE INDEX upgradehistbyseq ON upgradehistory (ledgerseq);";
 }
 
 void
-Upgrades::storeUpgradeHistory(Database& db, uint32_t ledgerSeq,
-                              LedgerUpgrade const& upgrade,
-                              LedgerEntryChanges const& changes, int index)
+Upgrades::dropSupportUpgradeHistory(Database& db)
 {
-    ZoneScoped;
-    xdr::opaque_vec<> upgradeContent(xdr::xdr_to_opaque(upgrade));
-    std::string upgradeContent64 = decoder::encode_b64(upgradeContent);
-
-    xdr::opaque_vec<> upgradeChanges(xdr::xdr_to_opaque(changes));
-    std::string upgradeChanges64 = decoder::encode_b64(upgradeChanges);
-
-    auto prep = db.getPreparedStatement(
-        "INSERT INTO upgradehistory "
-        "(ledgerseq, upgradeindex,  upgrade,  changes) VALUES "
-        "(:seq,      :upgradeindex, :upgrade, :changes)");
-
-    auto& st = prep.statement();
-    st.exchange(soci::use(ledgerSeq));
-    st.exchange(soci::use(index));
-    st.exchange(soci::use(upgradeContent64));
-    st.exchange(soci::use(upgradeChanges64));
-    st.define_and_bind();
-    {
-        ZoneNamedN(insertUpgradeZone, "insert upgradehistory", true);
-        st.execute(true);
-    }
-
-    if (st.get_affected_rows() != 1)
-    {
-        throw std::runtime_error("Could not update data in SQL");
-    }
-}
-
-void
-Upgrades::deleteOldEntries(Database& db, uint32_t ledgerSeq, uint32_t count)
-{
-    ZoneScoped;
-    DatabaseUtils::deleteOldEntriesHelper(db.getSession(), ledgerSeq, count,
-                                          "upgradehistory", "ledgerseq");
-}
-
-void
-Upgrades::deleteNewerEntries(Database& db, uint32_t ledgerSeq)
-{
-    ZoneScoped;
-    DatabaseUtils::deleteNewerEntriesHelper(db.getSession(), ledgerSeq,
-                                            "upgradehistory", "ledgerseq");
+    db.getRawSession() << "DROP TABLE IF EXISTS upgradehistory";
 }
 
 static void
@@ -1243,10 +1199,30 @@ Upgrades::applyVersionUpgrade(Application& app, AbstractLedgerTxn& ltx,
     if (needUpgradeToVersion(SOROBAN_PROTOCOL_VERSION, prevVersion, newVersion))
     {
         SorobanNetworkConfig::createLedgerEntriesForV20(ltx, app);
+#ifdef BUILD_TESTS
+        // Update the costs in case if we're in loadgen mode, so that the costs
+        // reflect the most recent calibration on p20. This would break
+        // if we tried to replay the ledger, but we shouldn't be combining load
+        // generation with the ledger replay.
+        if (app.getConfig().ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING &&
+            app.getConfig()
+                .UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING)
+        {
+            SorobanNetworkConfig::updateRecalibratedCostTypesForV20(ltx);
+        }
+#endif
     }
     if (needUpgradeToVersion(ProtocolVersion::V_21, prevVersion, newVersion))
     {
         SorobanNetworkConfig::createCostTypesForV21(ltx, app);
+    }
+    if (needUpgradeToVersion(ProtocolVersion::V_22, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createCostTypesForV22(ltx, app);
+    }
+    if (needUpgradeToVersion(ProtocolVersion::V_23, prevVersion, newVersion))
+    {
+        SorobanNetworkConfig::createLedgerEntriesForV23(ltx, app);
     }
 }
 

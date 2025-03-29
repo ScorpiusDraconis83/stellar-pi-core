@@ -114,9 +114,11 @@ class XDRInputFileStream
         return sz;
     }
 
+    // If a hasher is provided, it will be updated with the raw XDR bytes
+    // read from the stream.
     template <typename T>
     bool
-    readOne(T& out)
+    readOne(T& out, SHA256* hasher = nullptr)
     {
         ZoneScoped;
         char szBuf[4];
@@ -147,6 +149,12 @@ class XDRInputFileStream
         {
             throw xdr::xdr_runtime_error(
                 "malformed XDR file or IO failure in readOne");
+        }
+
+        if (hasher)
+        {
+            hasher->add(ByteSlice(szBuf, sizeof(szBuf)));
+            hasher->add(ByteSlice(mBuf.data(), sz));
         }
 
         xdr::xdr_get g(mBuf.data(), mBuf.data() + sz);
@@ -224,10 +232,19 @@ class XDRInputFileStream
     }
 };
 
-// XDROutputFileStream needs access to a file descriptor to do fsync, so we use
-// asio's synchronous stream types here rather than fstreams.
-class XDROutputFileStream
+/*
+IMPORTANT: some areas of core require durable writes that
+are resistant to application and system crashes. If you need durable writes:
+1. Use a stream implementation that supports fsync, e.g. OutputFileStream
+2. Write to a temp file first. If you don't intent to persist temp files across
+runs, fsyncing on close is sufficient. Otherwise, use durableWriteOne to flush
+and fsync after every write.
+3. Close the temp stream to make sure flush and fsync are called.
+4. Rename the temp file to the final location using durableRename.
+*/
+class OutputFileStream
 {
+  protected:
     std::vector<char> mBuf;
     const bool mFsyncOnClose;
 
@@ -236,12 +253,13 @@ class XDROutputFileStream
     fs::native_handle_t mHandle;
     FILE* mOut{nullptr};
 #else
-    // buffered stream
+    // use buffered stream which supports accessing a file descriptor needed to
+    // fsync
     asio::buffered_write_stream<stellar::fs::stream_t> mBufferedWriteStream;
 #endif
 
   public:
-    XDROutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
+    OutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
         : mFsyncOnClose(fsyncOnClose)
 #ifndef WIN32
         , mBufferedWriteStream(ctx, stellar::fs::bufsz())
@@ -249,7 +267,7 @@ class XDROutputFileStream
     {
     }
 
-    ~XDROutputFileStream()
+    ~OutputFileStream()
     {
         if (isOpen())
         {
@@ -377,17 +395,73 @@ class XDROutputFileStream
         return isOpen();
     }
 
-    template <typename T>
     void
-    writeOne(T const& t, SHA256* hasher = nullptr, size_t* bytesPut = nullptr)
+    writeBytes(char const* buf, size_t const sizeBytes)
     {
         ZoneScoped;
         if (!isOpen())
         {
             FileSystemException::failWith(
-                "XDROutputFileStream::writeOne() on non-open stream");
+                "OutputFileStream::writeBytes() on non-open stream");
         }
 
+        size_t written = 0;
+        while (written < sizeBytes)
+        {
+#ifdef WIN32
+            auto w = fwrite(buf + written, 1, sizeBytes - written, mOut);
+            if (w == 0)
+            {
+                FileSystemException::failWith(
+                    std::string("XDROutputFileStream::writeOne() failed"));
+            }
+            written += w;
+#else
+            asio::error_code ec;
+            auto asioBuf = asio::buffer(buf + written, sizeBytes - written);
+            written += asio::write(mBufferedWriteStream, asioBuf, ec);
+            if (ec)
+            {
+                if (ec == asio::error::interrupted)
+                {
+                    continue;
+                }
+                else
+                {
+                    FileSystemException::failWith(
+                        std::string(
+                            "XDROutputFileStream::writeOne() failed: ") +
+                        ec.message());
+                }
+            }
+#endif
+        }
+    }
+};
+
+class XDROutputFileStream : public OutputFileStream
+{
+  public:
+    XDROutputFileStream(asio::io_context& ctx, bool fsyncOnClose)
+        : OutputFileStream(ctx, fsyncOnClose)
+    {
+    }
+
+    template <typename T>
+    void
+    durableWriteOne(T const& t, SHA256* hasher = nullptr,
+                    size_t* bytesPut = nullptr)
+    {
+        writeOne(t, hasher, bytesPut);
+        flush();
+        fs::flushFileChanges(getHandle());
+    }
+
+    template <typename T>
+    void
+    writeOne(T const& t, SHA256* hasher = nullptr, size_t* bytesPut = nullptr)
+    {
+        ZoneScoped;
         uint32_t sz = (uint32_t)xdr::xdr_size(t);
         releaseAssertOrThrow(sz < 0x80000000);
 
@@ -405,41 +479,13 @@ class XDROutputFileStream
         xdr::xdr_put p(mBuf.data() + 4, mBuf.data() + 4 + sz);
         xdr_argpack_archive(p, t);
 
-        size_t const to_write = sz + 4;
-        size_t written = 0;
-        while (written < to_write)
-        {
-#ifdef WIN32
-            auto w = fwrite(mBuf.data() + written, 1, to_write - written, mOut);
-            if (w == 0)
-            {
-                FileSystemException::failWith(
-                    std::string("XDROutputFileStream::writeOne() failed"));
-            }
-            written += w;
-#else
-            asio::error_code ec;
-            auto buf = asio::buffer(mBuf.data() + written, to_write - written);
-            written += asio::write(mBufferedWriteStream, buf, ec);
-            if (ec)
-            {
-                if (ec == asio::error::interrupted)
-                {
-                    continue;
-                }
-                else
-                {
-                    FileSystemException::failWith(
-                        std::string(
-                            "XDROutputFileStream::writeOne() failed: ") +
-                        ec.message());
-                }
-            }
-#endif
-        }
+        // Buffer is 4 bytes of encoded size, followed by encoded object
+        size_t const toWrite = sz + 4;
+        writeBytes(mBuf.data(), toWrite);
+
         if (hasher)
         {
-            hasher->add(ByteSlice(mBuf.data(), sz + 4));
+            hasher->add(ByteSlice(mBuf.data(), toWrite));
         }
         if (bytesPut)
         {

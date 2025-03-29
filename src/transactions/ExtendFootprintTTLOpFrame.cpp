@@ -51,20 +51,18 @@ ExtendFootprintTTLOpFrame::isOpSupported(LedgerHeader const& header) const
 
 bool
 ExtendFootprintTTLOpFrame::doApply(
-    Application& app, AbstractLedgerTxn& ltx, Hash const& sorobanBasePrngSeed,
+    AppConnector& app, AbstractLedgerTxn& ltx, Hash const& sorobanBasePrngSeed,
     OperationResult& res, std::shared_ptr<SorobanTxData> sorobanData) const
 {
     releaseAssertOrThrow(sorobanData);
     ZoneNamedN(applyZone, "ExtendFootprintTTLOpFrame apply", true);
 
-    ExtendFootprintTTLMetrics metrics(
-        app.getLedgerManager().getSorobanMetrics());
+    ExtendFootprintTTLMetrics metrics(app.getSorobanMetrics());
     auto timeScope = metrics.getExecTimer();
 
     auto const& resources = mParentTx.sorobanResources();
     auto const& footprint = resources.footprint;
-    auto const& sorobanConfig =
-        app.getLedgerManager().getSorobanNetworkConfig();
+    auto const& sorobanConfig = app.getSorobanNetworkConfigForApply();
 
     rust::Vec<CxxLedgerEntryRentChange> rustEntryRentChanges;
     rustEntryRentChanges.reserve(footprint.readOnly.size());

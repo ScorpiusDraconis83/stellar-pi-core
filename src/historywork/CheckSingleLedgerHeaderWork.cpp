@@ -7,6 +7,7 @@
 #include "history/HistoryArchive.h"
 #include "history/HistoryManager.h"
 #include "historywork/GetAndUnzipRemoteFileWork.h"
+#include "main/ErrorMessages.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/TmpDir.h"
@@ -56,10 +57,10 @@ CheckSingleLedgerHeaderWork::doReset()
     mGetLedgerFileWork.reset();
     mDownloadDir =
         std::make_unique<TmpDir>(mApp.getTmpDirManager().tmpDir(getName()));
-    uint32_t checkpoint = mApp.getHistoryManager().checkpointContainingLedger(
-        mExpected.header.ledgerSeq);
+    uint32_t checkpoint = HistoryManager::checkpointContainingLedger(
+        mExpected.header.ledgerSeq, mApp.getConfig());
     mFt = std::make_unique<FileTransferInfo>(
-        *mDownloadDir, HISTORY_FILE_TYPE_LEDGER, checkpoint);
+        *mDownloadDir, FileType::HISTORY_FILE_TYPE_LEDGER, checkpoint);
 }
 
 BasicWork::State
@@ -84,9 +85,16 @@ CheckSingleLedgerHeaderWork::doWork()
     }
     else if (mGetLedgerFileWork->getState() != State::WORK_SUCCESS)
     {
-        CLOG_ERROR(History,
-                   "Failed to download ledger checkpoint {} from archive {}",
-                   mFt->baseName_gz(), mArchive->getName());
+        CLOG_ERROR(
+            History,
+            "Failed to download ledger checkpoint {} from archive {}: {}",
+            mFt->baseName_gz(), mArchive->getName(),
+            POSSIBLY_CORRUPTED_HISTORY);
+        CLOG_ERROR(
+            History,
+            "If this occurs often, consider notifying the archive "
+            "owner. As long as your configuration has any valid history "
+            "archives, this error does NOT mean your node is unhealthy.");
         return mGetLedgerFileWork->getState();
     }
 
@@ -96,7 +104,8 @@ CheckSingleLedgerHeaderWork::doWork()
     XDRInputFileStream in;
     in.open(mFt->localPath_nogz());
     LedgerHeaderHistoryEntry lhhe;
-    size_t headersToRead = mApp.getHistoryManager().getCheckpointFrequency();
+    size_t headersToRead =
+        HistoryManager::getCheckpointFrequency(mApp.getConfig());
     try
     {
         while (in && in.readOne<LedgerHeaderHistoryEntry>(lhhe))

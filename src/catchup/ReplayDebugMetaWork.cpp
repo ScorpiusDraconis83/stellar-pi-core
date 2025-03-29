@@ -163,8 +163,9 @@ ReplayDebugMetaWork::applyLastLedger()
     auto lcl = mApp.getLedgerManager().getLastClosedLedgerNum();
     if (lcl + 1 == debugTxSet.ledgerSeq)
     {
-        mApp.getLedgerManager().closeLedger(
-            LedgerCloseData::toLedgerCloseData(debugTxSet));
+        mApp.getLedgerManager().applyLedger(
+            LedgerCloseData::toLedgerCloseData(debugTxSet),
+            /* externalize */ false);
     }
     else
     {

@@ -3,7 +3,6 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "catchup/CatchupWork.h"
-#include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
 #include "catchup/ApplyBucketsWork.h"
 #include "catchup/ApplyBufferedLedgersWork.h"
@@ -20,7 +19,6 @@
 #include "historywork/DownloadVerifyTxResultsWork.h"
 #include "historywork/GetAndUnzipRemoteFileWork.h"
 #include "historywork/GetHistoryArchiveStateWork.h"
-#include "historywork/VerifyBucketWork.h"
 #include "ledger/LedgerManager.h"
 #include "main/Application.h"
 #include "main/PersistentState.h"
@@ -77,7 +75,7 @@ setHerderStateTo(FileTransferInfo const& ft, uint32_t ledger, Application& app)
 
 CatchupWork::CatchupWork(Application& app,
                          CatchupConfiguration catchupConfiguration,
-                         std::set<std::shared_ptr<Bucket>> bucketsToRetain,
+                         std::set<std::shared_ptr<LiveBucket>> bucketsToRetain,
                          std::shared_ptr<HistoryArchive> archive)
     : Work(app, "catchup", BasicWork::RETRY_NEVER)
     , mLocalState{app.getLedgerManager().getLastClosedLedgerHAS()}
@@ -92,10 +90,6 @@ CatchupWork::CatchupWork(Application& app,
         CLOG_INFO(History, "CatchupWork: selected archive {}",
                   mArchive->getName());
     }
-
-    // Local catchup is only valid if core is rebuilding state
-    releaseAssert(mCatchupConfiguration.localBucketsOnly() ==
-                  mApp.getLedgerManager().rebuildingInMemoryState());
 }
 
 CatchupWork::~CatchupWork()
@@ -156,8 +150,6 @@ void
 CatchupWork::downloadVerifyLedgerChain(CatchupRange const& catchupRange,
                                        LedgerNumHashPair rangeEnd)
 {
-    releaseAssert(!mCatchupConfiguration.localBucketsOnly());
-
     ZoneScoped;
     auto verifyRange = catchupRange.getFullRangeIncludingBucketApply();
     releaseAssert(verifyRange.mCount != 0);
@@ -166,8 +158,8 @@ CatchupWork::downloadVerifyLedgerChain(CatchupRange const& catchupRange,
     // Batch download has default retries ("a few") to ensure we rotate through
     // archives
     auto getLedgers = std::make_shared<BatchDownloadWork>(
-        mApp, checkpointRange, HISTORY_FILE_TYPE_LEDGER, *mDownloadDir,
-        mArchive);
+        mApp, checkpointRange, FileType::HISTORY_FILE_TYPE_LEDGER,
+        *mDownloadDir, mArchive);
     mRangeEndPromise = std::promise<LedgerNumHashPair>();
     mRangeEndFuture = mRangeEndPromise.get_future().share();
     mRangeEndPromise.set_value(rangeEnd);
@@ -177,7 +169,7 @@ CatchupWork::downloadVerifyLedgerChain(CatchupRange const& catchupRange,
 
     mVerifyLedgers = std::make_shared<VerifyLedgerChainWork>(
         mApp, *mDownloadDir, verifyRange, mLastClosedLedgerHashPair,
-        mRangeEndFuture, std::move(fatalFailurePromise));
+        std::nullopt, mRangeEndFuture, std::move(fatalFailurePromise));
 
     // Never retry the sequence: downloads already have retries, and there's no
     // point retrying verification
@@ -200,9 +192,8 @@ CatchupWork::downloadVerifyTxResults(CatchupRange const& catchupRange)
 bool
 CatchupWork::alreadyHaveBucketsHistoryArchiveState(uint32_t atCheckpoint) const
 {
-    return mCatchupConfiguration.localBucketsOnly() ||
-           atCheckpoint == mGetHistoryArchiveStateWork->getHistoryArchiveState()
-                               .currentLedger;
+    return atCheckpoint ==
+           mGetHistoryArchiveStateWork->getHistoryArchiveState().currentLedger;
 }
 
 WorkSeqPtr
@@ -214,51 +205,31 @@ CatchupWork::downloadApplyBuckets()
     // the database. This guarantees that we clear that state the next time
     // the application starts.
     auto& ps = mApp.getPersistentState();
-    for (auto let : xdr::xdr_traits<LedgerEntryType>::enum_values())
-    {
-        ps.setRebuildForType(static_cast<LedgerEntryType>(let));
-    }
+    ps.setRebuildForOfferTable();
 
     std::vector<std::shared_ptr<BasicWork>> seq;
     auto version = mApp.getConfig().LEDGER_PROTOCOL_VERSION;
 
-    // Download buckets, or skip if catchup is local
-    if (!mCatchupConfiguration.localBucketsOnly())
-    {
-        std::vector<std::string> hashes =
-            mBucketHAS->differingBuckets(mLocalState);
-        auto getBuckets = std::make_shared<DownloadBucketsWork>(
-            mApp, mBuckets, hashes, *mDownloadDir, mArchive);
-        seq.push_back(getBuckets);
+    std::vector<std::string> hashes = mBucketHAS->differingBuckets(mLocalState);
+    auto getBuckets = std::make_shared<DownloadBucketsWork>(
+        mApp, mBuckets, hashes, *mDownloadDir, mArchive);
+    seq.push_back(getBuckets);
 
-        auto verifyHASCallback = [has = *mBucketHAS](Application& app) {
-            if (!has.containsValidBuckets(app))
-            {
-                CLOG_ERROR(History, "Malformed HAS: invalid buckets");
-                return false;
-            }
-            return true;
-        };
-        auto verifyHAS = std::make_shared<WorkWithCallback>(mApp, "verify-has",
-                                                            verifyHASCallback);
-        seq.push_back(verifyHAS);
-        version = mVerifiedLedgerRangeStart.header.ledgerVersion;
-    }
+    auto verifyHASCallback = [has = *mBucketHAS](Application& app) {
+        if (!has.containsValidBuckets(app))
+        {
+            CLOG_ERROR(History, "Malformed HAS: invalid buckets");
+            return false;
+        }
+        return true;
+    };
+    auto verifyHAS = std::make_shared<WorkWithCallback>(mApp, "verify-has",
+                                                        verifyHASCallback);
+    seq.push_back(verifyHAS);
+    version = mVerifiedLedgerRangeStart.header.ledgerVersion;
 
-    std::shared_ptr<ApplyBucketsWork> applyBuckets;
-    if (mApp.getConfig().isUsingBucketListDB())
-    {
-        // Only apply unsupported BucketListDB types to SQL DB when BucketList
-        // lookup is enabled
-        applyBuckets = std::make_shared<ApplyBucketsWork>(
-            mApp, mBuckets, *mBucketHAS, version,
-            BucketIndex::typeNotSupported);
-    }
-    else
-    {
-        applyBuckets = std::make_shared<ApplyBucketsWork>(mApp, mBuckets,
-                                                          *mBucketHAS, version);
-    }
+    auto applyBuckets = std::make_shared<ApplyBucketsWork>(
+        mApp, mBuckets, *mBucketHAS, version);
     seq.push_back(applyBuckets);
     return std::make_shared<WorkSequence>(mApp, "download-verify-apply-buckets",
                                           seq, RETRY_NEVER);
@@ -312,52 +283,37 @@ BasicWork::State
 CatchupWork::getAndMaybeSetHistoryArchiveState()
 {
     // First, retrieve the HAS
-
-    // If we're just doing local catchup, set HAS right away
-    if (mCatchupConfiguration.localBucketsOnly())
+    if (!mGetHistoryArchiveStateWork)
     {
-        mHAS = getCatchupConfiguration().getHAS();
-        releaseAssert(mHAS.has_value());
+        auto toLedger = mCatchupConfiguration.toLedger() == 0
+                            ? "CURRENT"
+                            : std::to_string(mCatchupConfiguration.toLedger());
+        CLOG_INFO(History,
+                  "Starting catchup with configuration:\n  lastClosedLedger: "
+                  "{}\n  toLedger: {}\n  count: {}",
+                  mApp.getLedgerManager().getLastClosedLedgerNum(), toLedger,
+                  mCatchupConfiguration.count());
+
+        auto toCheckpoint =
+            mCatchupConfiguration.toLedger() == CatchupConfiguration::CURRENT
+                ? CatchupConfiguration::CURRENT
+                : HistoryManager::checkpointContainingLedger(
+                      mCatchupConfiguration.toLedger(), mApp.getConfig());
+        // Set retries to 10 to ensure we retry enough in case current
+        // checkpoint isn't published yet
+        mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
+            toCheckpoint, mArchive, true, 10);
+        mCurrentWork = mGetHistoryArchiveStateWork;
+        return State::WORK_RUNNING;
+    }
+    else if (mGetHistoryArchiveStateWork->getState() != State::WORK_SUCCESS)
+    {
+        return mGetHistoryArchiveStateWork->getState();
     }
     else
     {
-        // Otherwise, continue with the normal catchup flow: download and verify
-        // HAS from history archive
-        if (!mGetHistoryArchiveStateWork)
-        {
-            auto toLedger =
-                mCatchupConfiguration.toLedger() == 0
-                    ? "CURRENT"
-                    : std::to_string(mCatchupConfiguration.toLedger());
-            CLOG_INFO(
-                History,
-                "Starting catchup with configuration:\n  lastClosedLedger: "
-                "{}\n  toLedger: {}\n  count: {}",
-                mApp.getLedgerManager().getLastClosedLedgerNum(), toLedger,
-                mCatchupConfiguration.count());
-
-            auto toCheckpoint =
-                mCatchupConfiguration.toLedger() ==
-                        CatchupConfiguration::CURRENT
-                    ? CatchupConfiguration::CURRENT
-                    : mApp.getHistoryManager().checkpointContainingLedger(
-                          mCatchupConfiguration.toLedger());
-            // Set retries to 10 to ensure we retry enough in case current
-            // checkpoint isn't published yet
-            mGetHistoryArchiveStateWork = addWork<GetHistoryArchiveStateWork>(
-                toCheckpoint, mArchive, true, 10);
-            mCurrentWork = mGetHistoryArchiveStateWork;
-            return State::WORK_RUNNING;
-        }
-        else if (mGetHistoryArchiveStateWork->getState() != State::WORK_SUCCESS)
-        {
-            return mGetHistoryArchiveStateWork->getState();
-        }
-        else
-        {
-            mHAS = std::make_optional<HistoryArchiveState>(
-                mGetHistoryArchiveStateWork->getHistoryArchiveState());
-        }
+        mHAS = std::make_optional<HistoryArchiveState>(
+            mGetHistoryArchiveStateWork->getHistoryArchiveState());
     }
 
     // Second, perform some validation
@@ -469,8 +425,7 @@ CatchupWork::runCatchupStep()
     // Bucket and transaction processing has started
     if (mCatchupSeq)
     {
-        releaseAssert(mDownloadVerifyLedgersSeq ||
-                      mCatchupConfiguration.localBucketsOnly());
+        releaseAssert(mDownloadVerifyLedgersSeq);
         releaseAssert(mTransactionsVerifyApplySeq ||
                       !catchupRange.replayLedgers());
 
@@ -496,7 +451,8 @@ CatchupWork::runCatchupStep()
                 }
             }
             // see if we need to apply buffered ledgers
-            if (mApp.getCatchupManager().maybeGetNextBufferedLedgerToApply())
+            if (mApp.getLedgerApplyManager()
+                    .maybeGetNextBufferedLedgerToApply())
             {
                 mApplyBufferedLedgersWork = addWork<ApplyBufferedLedgersWork>();
                 mCurrentWork = mApplyBufferedLedgersWork;
@@ -514,8 +470,7 @@ CatchupWork::runCatchupStep()
                 // the node will have to catch up again and it will clear the
                 // ledger because clearRebuildForType has not been called yet.
                 mApp.getLedgerManager().setLastClosedLedger(
-                    mVerifiedLedgerRangeStart,
-                    !mCatchupConfiguration.localBucketsOnly());
+                    mVerifiedLedgerRangeStart);
                 mBucketsAppliedEmitted = true;
                 mBuckets.clear();
                 mLastApplied =
@@ -531,10 +486,7 @@ CatchupWork::runCatchupStep()
                 // persistently available locally so it will return us to the
                 // correct state.
                 auto& ps = mApp.getPersistentState();
-                for (auto let : xdr::xdr_traits<LedgerEntryType>::enum_values())
-                {
-                    ps.clearRebuildForType(static_cast<LedgerEntryType>(let));
-                }
+                ps.clearRebuildForOfferTable();
             }
         }
         else if (mTransactionsVerifyApplySeq)
@@ -555,22 +507,6 @@ CatchupWork::runCatchupStep()
             }
         }
         return mCatchupSeq->getState();
-    }
-
-    // If we're just doing local catchup, setup bucket application and exit
-    if (mCatchupConfiguration.localBucketsOnly())
-    {
-        releaseAssert(catchupRange.applyBuckets());
-        auto lhhe = mCatchupConfiguration.getHistoryEntry();
-        releaseAssert(lhhe);
-        mVerifiedLedgerRangeStart = *lhhe;
-
-        mBucketVerifyApplySeq = downloadApplyBuckets();
-        std::vector<std::shared_ptr<BasicWork>> seq{mBucketVerifyApplySeq};
-
-        mCatchupSeq = addWork<WorkSequence>("catchup-seq", seq, RETRY_NEVER);
-        mCurrentWork = mCatchupSeq;
-        return State::WORK_RUNNING;
     }
 
     // Otherwise, proceed with normal flow. Still waiting for ledger headers
@@ -595,11 +531,10 @@ CatchupWork::runCatchupStep()
                     return true;
                 }
 
-                auto checkpoint =
-                    app.getHistoryManager().checkpointContainingLedger(
-                        ledgerSeq);
-                auto ft =
-                    FileTransferInfo(dir, HISTORY_FILE_TYPE_LEDGER, checkpoint);
+                auto checkpoint = HistoryManager::checkpointContainingLedger(
+                    ledgerSeq, app.getConfig());
+                auto ft = FileTransferInfo(
+                    dir, FileType::HISTORY_FILE_TYPE_LEDGER, checkpoint);
 
                 return setHerderStateTo(ft, ledgerSeq, app);
             };
@@ -657,14 +592,14 @@ CatchupWork::doWork()
 {
     ZoneScoped;
     auto nextState = runCatchupStep();
-    auto& cm = mApp.getCatchupManager();
+    auto& lam = mApp.getLedgerApplyManager();
 
     if (nextState == BasicWork::State::WORK_SUCCESS)
     {
-        releaseAssert(!cm.maybeGetNextBufferedLedgerToApply());
+        releaseAssert(!lam.maybeGetNextBufferedLedgerToApply());
     }
 
-    cm.logAndUpdateCatchupStatus(true);
+    lam.logAndUpdateCatchupStatus(true);
     return nextState;
 }
 
@@ -673,10 +608,6 @@ CatchupWork::onFailureRaise()
 {
     CLOG_WARNING(History, "Catchup failed");
     Work::onFailureRaise();
-    if (mCatchupConfiguration.localBucketsOnly())
-    {
-        throw std::runtime_error("Unable to rebuild local state");
-    }
 }
 
 void

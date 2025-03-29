@@ -4,6 +4,7 @@
 
 #include "historywork/VerifyTxResultsWork.h"
 #include "history/FileTransferInfo.h"
+#include "history/HistoryUtils.h"
 #include "ledger/LedgerManager.h"
 #include "main/ErrorMessages.h"
 #include "util/FileSystemException.h"
@@ -89,9 +90,9 @@ VerifyTxResultsWork::verifyTxResultsOfCheckpoint()
     ZoneScoped;
     try
     {
-        FileTransferInfo hi(mDownloadDir, HISTORY_FILE_TYPE_LEDGER,
+        FileTransferInfo hi(mDownloadDir, FileType::HISTORY_FILE_TYPE_LEDGER,
                             mCheckpoint);
-        FileTransferInfo ri(mDownloadDir, HISTORY_FILE_TYPE_RESULTS,
+        FileTransferInfo ri(mDownloadDir, FileType::HISTORY_FILE_TYPE_RESULTS,
                             mCheckpoint);
         mHdrIn.open(hi.localPath_nogz());
         mResIn.open(ri.localPath_nogz());
@@ -144,48 +145,30 @@ VerifyTxResultsWork::getCurrentTxResultSet(uint32_t ledger)
     TransactionHistoryResultEntry trs;
     trs.ledgerSeq = ledger;
 
-    auto readNextWithValidation = [&]() {
-        auto res = mResIn.readOne(mTxResultEntry);
-        if (res)
+    auto validateFn = [this](uint32_t readLedger) {
+        auto low = HistoryManager::firstLedgerInCheckpointContaining(
+            mCheckpoint, mApp.getConfig());
+        if (readLedger > mCheckpoint || readLedger < low)
         {
-            auto readLedger = mTxResultEntry.ledgerSeq;
-            auto const& hm = mApp.getHistoryManager();
-
-            auto low = hm.firstLedgerInCheckpointContaining(mCheckpoint);
-            if (readLedger > mCheckpoint || readLedger < low)
-            {
-                throw std::runtime_error("Results outside of checkpoint range");
-            }
-
-            if (readLedger <= mLastSeenLedger)
-            {
-                throw std::runtime_error("Malformed or duplicate results: "
-                                         "ledgers must be strictly increasing");
-            }
-            mLastSeenLedger = readLedger;
+            throw std::runtime_error("Results outside of checkpoint range");
         }
-        return res;
+
+        if (readLedger <= mLastSeenLedger)
+        {
+            throw std::runtime_error("Malformed or duplicate results: "
+                                     "ledgers must be strictly increasing");
+        }
+        mLastSeenLedger = readLedger;
     };
 
-    do
+    auto foundEntry = getHistoryEntryForLedger<TransactionHistoryResultEntry>(
+        mResIn, mTxResultEntry, ledger, validateFn);
+
+    if (foundEntry)
     {
-        if (mTxResultEntry.ledgerSeq < ledger)
-        {
-            CLOG_DEBUG(History, "Processed tx results for ledger {}",
-                       mTxResultEntry.ledgerSeq);
-        }
-        else if (mTxResultEntry.ledgerSeq > ledger)
-        {
-            // No tx results in this ledger
-            break;
-        }
-        else
-        {
-            CLOG_DEBUG(History, "Loaded tx result set for ledger {}", ledger);
-            trs.txResultSet = mTxResultEntry.txResultSet;
-            return trs;
-        }
-    } while (mResIn && readNextWithValidation());
+        CLOG_DEBUG(History, "Loaded tx result set for ledger {}", ledger);
+        trs.txResultSet = mTxResultEntry.txResultSet;
+    }
 
     return trs;
 }

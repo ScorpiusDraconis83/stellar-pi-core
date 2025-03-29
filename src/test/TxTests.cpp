@@ -141,7 +141,8 @@ applyCheck(TransactionTestFramePtr tx, Application& app, bool checkSeqNum)
     {
         LedgerTxn ltxFeeProc(ltx);
         // use checkedTx here for validity check as to keep tx untouched
-        check = checkedTx->checkValidForTesting(app, ltxFeeProc, 0, 0, 0);
+        check = checkedTx->checkValidForTesting(app.getAppConnector(),
+                                                ltxFeeProc, 0, 0, 0);
         checkResult = checkedTx->getResult();
         REQUIRE((!check || checkResult.result.code() == txSUCCESS));
 
@@ -166,7 +167,8 @@ applyCheck(TransactionTestFramePtr tx, Application& app, bool checkSeqNum)
             {
                 TransactionMetaFrame cleanTm(
                     ltxCleanTx.loadHeader().current().ledgerVersion);
-                checkedTxApplyRes = checkedTx->apply(app, ltxCleanTx, cleanTm);
+                checkedTxApplyRes = checkedTx->apply(app.getAppConnector(),
+                                                     ltxCleanTx, cleanTm);
             }
             catch (...)
             {
@@ -233,7 +235,7 @@ applyCheck(TransactionTestFramePtr tx, Application& app, bool checkSeqNum)
         TransactionMetaFrame tm(ltxTx.loadHeader().current().ledgerVersion);
         try
         {
-            res = tx->apply(app, ltxTx, tm);
+            res = tx->apply(app.getAppConnector(), ltxTx, tm);
         }
         catch (...)
         {
@@ -370,6 +372,9 @@ applyCheck(TransactionTestFramePtr tx, Application& app, bool checkSeqNum)
         recordOrCheckGlobalTestTxMetadata(tm.getXDR());
     }
 
+    // TODO: in-memory mode doesn't work with parallel ledger apply because
+    // it manually modifies LedgerTxn without closing a ledger; this results
+    // in a different ledger header stored inside of LedgerTxn
     ltx.commit();
 
     return res;
@@ -387,9 +392,13 @@ checkTransaction(TransactionTestFrame& txFrame, Application& app)
 void
 applyTx(TransactionTestFramePtr const& tx, Application& app, bool checkSeqNum)
 {
+    if (app.getConfig().MODE_USES_IN_MEMORY_LEDGER)
+    {
+        applyCheck(tx, app, checkSeqNum);
+    }
     // We cannot commit directly to the DB if running BucketListDB, so close a
     // ledger with the TX instead
-    if (app.getConfig().isUsingBucketListDB())
+    else
     {
         auto resultSet = closeLedger(app, {tx});
 
@@ -403,10 +412,6 @@ applyTx(TransactionTestFramePtr const& tx, Application& app, bool checkSeqNum)
         auto meta = app.getLedgerManager().getLastClosedLedgerTxMeta();
         REQUIRE(meta.size() == 1);
         recordOrCheckGlobalTestTxMetadata(meta.back().getXDR());
-    }
-    else
-    {
-        applyCheck(tx, app, checkSeqNum);
     }
 
     throwIf(tx->getResult());
@@ -437,8 +442,8 @@ validateTxResults(TransactionTestFramePtr const& tx, Application& app,
                                                       tx->getEnvelope()));
     {
         LedgerTxn ltx(app.getLedgerTxnRoot());
-        REQUIRE(checkedTx->checkValidForTesting(app, ltx, 0, 0, 0) ==
-                shouldValidateOk);
+        REQUIRE(checkedTx->checkValidForTesting(app.getAppConnector(), ltx, 0,
+                                                0, 0) == shouldValidateOk);
     }
     REQUIRE(checkedTx->getResult().result.code() == validationResult.code);
     REQUIRE(checkedTx->getResult().feeCharged == validationResult.fee);
@@ -499,7 +504,7 @@ closeLedgerOn(Application& app, int day, int month, int year,
 
 TransactionResultSet
 closeLedger(Application& app, std::vector<TransactionFrameBasePtr> const& txs,
-            bool strictOrder)
+            bool strictOrder, xdr::xvector<UpgradeType, 6> const& upgrades)
 {
     auto lastCloseTime = app.getLedgerManager()
                              .getLastClosedLedgerHeader()
@@ -507,12 +512,14 @@ closeLedger(Application& app, std::vector<TransactionFrameBasePtr> const& txs,
 
     auto nextLedgerSeq = app.getLedgerManager().getLastClosedLedgerNum() + 1;
 
-    return closeLedgerOn(app, nextLedgerSeq, lastCloseTime, txs, strictOrder);
+    return closeLedgerOn(app, nextLedgerSeq, lastCloseTime, txs, strictOrder,
+                         upgrades);
 }
 
 TransactionResultSet
 closeLedgerOn(Application& app, uint32 ledgerSeq, TimePoint closeTime,
-              std::vector<TransactionFrameBasePtr> const& txs, bool strictOrder)
+              std::vector<TransactionFrameBasePtr> const& txs, bool strictOrder,
+              xdr::xvector<UpgradeType, 6> const& upgrades)
 {
     auto lastCloseTime = app.getLedgerManager()
                              .getLastClosedLedgerHeader()
@@ -536,15 +543,15 @@ closeLedgerOn(Application& app, uint32 ledgerSeq, TimePoint closeTime,
         }
         else
         {
-            TxSetTransactions classic;
-            TxSetTransactions soroban;
+            TxFrameList classic;
+            TxFrameList soroban;
             for (auto const& tx : txs)
             {
                 tx->isSoroban() ? soroban.emplace_back(tx)
                                 : classic.emplace_back(tx);
             }
 
-            TxSetPhaseTransactions phases = {classic};
+            PerPhaseTransactionList phases = {classic};
             if (!soroban.empty())
             {
                 phases.emplace_back(soroban);
@@ -557,12 +564,17 @@ closeLedgerOn(Application& app, uint32 ledgerSeq, TimePoint closeTime,
         // `strictOrder` means the txs in the txSet will be applied in the exact
         // same order as they were constructed. It could also imply the txs
         // themselves maybe intentionally invalid for testing purpose.
-        REQUIRE(txSet.second->checkValid(app, 0, 0));
+        releaseAssert(txSet.second->checkValid(app, 0, 0));
     }
     app.getHerder().externalizeValue(txSet.first, ledgerSeq, closeTime,
-                                     emptyUpgradeSteps);
-    REQUIRE(app.getLedgerManager().getLastClosedLedgerNum() == ledgerSeq);
-    return getTransactionHistoryResults(app.getDatabase(), ledgerSeq);
+                                     upgrades);
+    // NB: this assert will probably stop being true when background apply is
+    // turned on by default: externalize will have handed the ledger off to
+    // apply but not yet received the results of apply or updated LCL. The fix
+    // should be just to crank here until LCL advances to ledgerSeq.
+    releaseAssert(app.getLedgerManager().getLastClosedLedgerNum() == ledgerSeq);
+    auto& lm = static_cast<LedgerManagerImpl&>(app.getLedgerManager());
+    return lm.mLatestTxResultSet;
 }
 
 TransactionResultSet
@@ -582,7 +594,8 @@ closeLedgerOn(Application& app, uint32 ledgerSeq, time_t closeTime,
     app.getHerder().externalizeValue(txSet, ledgerSeq, closeTime,
                                      emptyUpgradeSteps);
 
-    auto z1 = getTransactionHistoryResults(app.getDatabase(), ledgerSeq);
+    auto& lm = static_cast<LedgerManagerImpl&>(app.getLedgerManager());
+    auto z1 = lm.mLatestTxResultSet;
 
     REQUIRE(app.getLedgerManager().getLastClosedLedgerNum() == ledgerSeq);
 
@@ -625,15 +638,15 @@ loadAccount(AbstractLedgerTxn& ltx, PublicKey const& k, bool mustExist)
 bool
 doesAccountExist(Application& app, PublicKey const& k)
 {
-    LedgerTxn ltx(app.getLedgerTxnRoot());
-    return (bool)stellar::loadAccountWithoutRecord(ltx, k);
+    LedgerSnapshot lss(app);
+    return (bool)lss.getAccount(k);
 }
 
 xdr::xvector<Signer, 20>
 getAccountSigners(PublicKey const& k, Application& app)
 {
-    LedgerTxn ltx(app.getLedgerTxnRoot());
-    auto account = stellar::loadAccount(ltx, k);
+    LedgerSnapshot lss(app);
+    auto account = lss.getAccount(k);
     return account.current().data.account().signers;
 }
 
@@ -693,11 +706,8 @@ transactionFromOperations(Application& app, SecretKey const& from,
                           SequenceNumber seq, const std::vector<Operation>& ops,
                           uint32_t fee)
 {
-    uint32_t ledgerVersion;
-    {
-        LedgerTxn ltx(app.getLedgerTxnRoot());
-        ledgerVersion = ltx.loadHeader().current().ledgerVersion;
-    }
+    auto ledgerVersion =
+        app.getLedgerManager().getLastClosedLedgerHeader().header.ledgerVersion;
     if (protocolVersionIsBefore(ledgerVersion, ProtocolVersion::V_13))
     {
         return transactionFromOperationsV0(app, from, seq, ops, fee);
@@ -923,7 +933,8 @@ sorobanResourceFee(Application& app, SorobanResources const& resources,
     auto feePair = TransactionFrame::computeSorobanResourceFee(
         app.getLedgerManager().getLastClosedLedgerHeader().header.ledgerVersion,
         resources, static_cast<uint32>(txSize), eventsSize,
-        app.getLedgerManager().getSorobanNetworkConfig(), app.getConfig());
+        app.getLedgerManager().getLastClosedSorobanNetworkConfig(),
+        app.getConfig());
     return feePair.non_refundable_fee + feePair.refundable_fee;
 }
 
@@ -1674,10 +1685,21 @@ sorobanEnvelopeFromOps(Hash const& networkID, TestAccount& source,
                        std::vector<SecretKey> const& opKeys,
                        SorobanResources const& resources, uint32_t totalFee,
                        int64_t resourceFee, std::optional<std::string> memo,
-                       std::optional<SequenceNumber> seq)
+                       std::optional<SequenceNumber> seq,
+                       std::optional<uint64_t> muxedData)
 {
     TransactionEnvelope tx(ENVELOPE_TYPE_TX);
-    tx.v1().tx.sourceAccount = toMuxedAccount(source);
+    if (muxedData)
+    {
+        MuxedAccount acc(CryptoKeyType::KEY_TYPE_MUXED_ED25519);
+        acc.med25519().ed25519 = source.getPublicKey().ed25519();
+        acc.med25519().id = *muxedData;
+        tx.v1().tx.sourceAccount = acc;
+    }
+    else
+    {
+        tx.v1().tx.sourceAccount = toMuxedAccount(source);
+    }
     tx.v1().tx.fee = totalFee;
     tx.v1().tx.seqNum = seq ? *seq : source.nextSequenceNumber();
     tx.v1().tx.ext.v(1);
@@ -1724,9 +1746,10 @@ sorobanTransactionFrameFromOps(Hash const& networkID, TestAccount& source,
     totalFee += resourceFee;
     releaseAssert(totalFee >= 0 && totalFee <= UINT32_MAX);
     auto tx = TransactionFrameBase::makeTransactionFromWire(
-        networkID, sorobanEnvelopeFromOps(
-                       networkID, source, ops, opKeys, resources,
-                       static_cast<uint32>(totalFee), resourceFee, memo, seq));
+        networkID,
+        sorobanEnvelopeFromOps(networkID, source, ops, opKeys, resources,
+                               static_cast<uint32>(totalFee), resourceFee, memo,
+                               seq, std::nullopt));
     return TransactionTestFrame::fromTxFrame(tx);
 }
 
@@ -1735,12 +1758,12 @@ sorobanTransactionFrameFromOpsWithTotalFee(
     Hash const& networkID, TestAccount& source,
     std::vector<Operation> const& ops, std::vector<SecretKey> const& opKeys,
     SorobanResources const& resources, uint32_t totalFee, int64_t resourceFee,
-    std::optional<std::string> memo)
+    std::optional<std::string> memo, std::optional<uint64> muxedData)
 {
     auto tx = TransactionFrameBase::makeTransactionFromWire(
-        networkID,
-        sorobanEnvelopeFromOps(networkID, source, ops, opKeys, resources,
-                               totalFee, resourceFee, memo, std::nullopt));
+        networkID, sorobanEnvelopeFromOps(networkID, source, ops, opKeys,
+                                          resources, totalFee, resourceFee,
+                                          memo, std::nullopt, muxedData));
     return TransactionTestFrame::fromTxFrame(tx);
 }
 

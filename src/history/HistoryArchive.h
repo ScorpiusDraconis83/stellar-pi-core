@@ -27,13 +27,15 @@ namespace stellar
 {
 
 class Application;
-class BucketList;
+class LiveBucketList;
 class Bucket;
 
 struct HistoryStateBucket
 {
     std::string curr;
-    FutureBucket next;
+
+    // TODO: Add archival buckets to history
+    FutureBucket<LiveBucket> next;
     std::string snap;
 
     template <class Archive>
@@ -60,6 +62,19 @@ struct HistoryStateBucket
  */
 struct HistoryArchiveState
 {
+    // Maximum supported size of a bucket in the history archive. This is used
+    // as a very basic DOS protection against downloading very large malicious
+    // buckets. If a downloaded bucket is above this size, we automatically fail
+    // it as invalid. Note that we will still publish Buckets over this size so
+    // the network doesn't halt, but we will warn significantly, as at that
+    // point no new nodes could assume state from lcl. This value is _very_
+    // large given ledger state size as of Feb 2025, but we may want to revisit
+    // in the future. Worst case if we forget about this, new nodes could still
+    // assume state from an earlier ledger where Bucket sizes were not above
+    // the limit and replay ledgers to join the network.
+    static constexpr size_t MAX_HISTORY_ARCHIVE_BUCKET_SIZE =
+        1024ull * 1024ull * 1024ull * 100ull; // 100 GB
+
     static unsigned const HISTORY_ARCHIVE_STATE_VERSION;
 
     unsigned version{HISTORY_ARCHIVE_STATE_VERSION};
@@ -70,7 +85,7 @@ struct HistoryArchiveState
 
     HistoryArchiveState();
 
-    HistoryArchiveState(uint32_t ledgerSeq, BucketList const& buckets,
+    HistoryArchiveState(uint32_t ledgerSeq, LiveBucketList const& buckets,
                         std::string const& networkPassphrase);
 
     static std::string baseName();
@@ -152,8 +167,7 @@ struct HistoryArchiveState
 class HistoryArchive : public std::enable_shared_from_this<HistoryArchive>
 {
   public:
-    explicit HistoryArchive(Application& app,
-                            HistoryArchiveConfiguration const& config);
+    explicit HistoryArchive(HistoryArchiveConfiguration const& config);
     ~HistoryArchive();
     bool hasGetCmd() const;
     bool hasPutCmd() const;

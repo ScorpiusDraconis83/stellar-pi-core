@@ -7,15 +7,14 @@
 // else.
 #include "util/asio.h"
 #include "history/HistoryArchive.h"
-#include "bucket/Bucket.h"
-#include "bucket/BucketList.h"
 #include "bucket/BucketManager.h"
+#include "bucket/LiveBucket.h"
+#include "bucket/LiveBucketList.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "history/HistoryManager.h"
 #include "main/Application.h"
 #include "main/StellarCoreVersion.h"
-#include "process/ProcessManager.h"
 #include "util/Fs.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
@@ -26,9 +25,7 @@
 #include <cereal/archives/json.hpp>
 #include <cereal/cereal.hpp>
 #include <cereal/types/vector.hpp>
-#include <chrono>
 #include <fstream>
-#include <future>
 #include <iostream>
 #include <medida/meter.h>
 #include <medida/metrics_registry.h>
@@ -246,7 +243,7 @@ HistoryArchiveState::differingBuckets(HistoryArchiveState const& other) const
         inhibit.insert(b.snap);
     }
     std::vector<std::string> ret;
-    for (size_t i = BucketList::kNumLevels; i != 0; --i)
+    for (size_t i = LiveBucketList::kNumLevels; i != 0; --i)
     {
         auto s = currentBuckets[i - 1].snap;
         auto n = s;
@@ -306,13 +303,13 @@ HistoryArchiveState::containsValidBuckets(Application& app) const
 
     // Process bucket, return version
     auto processBucket = [&](std::string const& bucketHash) {
-        auto bucket =
-            app.getBucketManager().getBucketByHash(hexToBin256(bucketHash));
+        auto bucket = app.getBucketManager().getBucketByHash<LiveBucket>(
+            hexToBin256(bucketHash));
         releaseAssert(bucket);
         int32_t version = 0;
         if (!bucket->isEmpty())
         {
-            version = Bucket::getBucketVersion(bucket);
+            version = bucket->getBucketVersion();
             if (!nonEmptySeen)
             {
                 nonEmptySeen = true;
@@ -322,7 +319,7 @@ HistoryArchiveState::containsValidBuckets(Application& app) const
     };
 
     // Iterate bottom-up, from oldest to newest buckets
-    for (uint32_t j = BucketList::kNumLevels; j != 0; --j)
+    for (uint32_t j = LiveBucketList::kNumLevels; j != 0; --j)
     {
         auto i = j - 1;
         auto const& level = currentBuckets[i];
@@ -358,7 +355,8 @@ HistoryArchiveState::containsValidBuckets(Application& app) const
             continue;
         }
         else if (protocolVersionStartsFrom(
-                     prevSnapVersion, Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+                     prevSnapVersion,
+                     LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
         {
             if (!level.next.isClear())
             {
@@ -384,16 +382,17 @@ HistoryArchiveState::prepareForPublish(Application& app)
     // Level 0 future buckets are always clear
     releaseAssert(currentBuckets[0].next.isClear());
 
-    for (uint32_t i = 1; i < BucketList::kNumLevels; i++)
+    for (uint32_t i = 1; i < LiveBucketList::kNumLevels; i++)
     {
         auto& level = currentBuckets[i];
         auto& prev = currentBuckets[i - 1];
 
-        auto snap =
-            app.getBucketManager().getBucketByHash(hexToBin256(prev.snap));
+        auto snap = app.getBucketManager().getBucketByHash<LiveBucket>(
+            hexToBin256(prev.snap));
         if (!level.next.isClear() &&
-            protocolVersionStartsFrom(Bucket::getBucketVersion(snap),
-                                      Bucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
+            protocolVersionStartsFrom(
+                snap->getBucketVersion(),
+                LiveBucket::FIRST_PROTOCOL_SHADOWS_REMOVED))
         {
             level.next.clear();
         }
@@ -423,32 +422,50 @@ HistoryArchiveState::HistoryArchiveState() : server(STELLAR_CORE_VERSION)
     HistoryStateBucket b;
     b.curr = s;
     b.snap = s;
-    while (currentBuckets.size() < BucketList::kNumLevels)
+    while (currentBuckets.size() < LiveBucketList::kNumLevels)
     {
         currentBuckets.push_back(b);
     }
 }
 
 HistoryArchiveState::HistoryArchiveState(uint32_t ledgerSeq,
-                                         BucketList const& buckets,
+                                         LiveBucketList const& buckets,
                                          std::string const& passphrase)
     : server(STELLAR_CORE_VERSION)
     , networkPassphrase(passphrase)
     , currentLedger(ledgerSeq)
 {
-    for (uint32_t i = 0; i < BucketList::kNumLevels; ++i)
+    for (uint32_t i = 0; i < LiveBucketList::kNumLevels; ++i)
     {
         HistoryStateBucket b;
         auto& level = buckets.getLevel(i);
-        b.curr = binToHex(level.getCurr()->getHash());
+        auto const& curr = level.getCurr();
+        auto const& snap = level.getSnap();
+        b.curr = binToHex(curr->getHash());
         b.next = level.getNext();
-        b.snap = binToHex(level.getSnap()->getHash());
+        b.snap = binToHex(snap->getHash());
         currentBuckets.push_back(b);
+
+        auto checkBucketSize = [](auto const& bucket) {
+            if (bucket->getSize() > MAX_HISTORY_ARCHIVE_BUCKET_SIZE)
+            {
+                CLOG_FATAL(
+                    History,
+                    "Bucket size ({}) is greater than the maximum allowed "
+                    "size ({}) for Bucket {}. stellar-core must be upgraded "
+                    "to a version supporting larger buckets or new nodes "
+                    "will not be able to join the network!",
+                    bucket->getSize(), MAX_HISTORY_ARCHIVE_BUCKET_SIZE,
+                    binToHex(bucket->getHash()));
+            }
+        };
+
+        checkBucketSize(curr);
+        checkBucketSize(snap);
     }
 }
 
-HistoryArchive::HistoryArchive(Application& app,
-                               HistoryArchiveConfiguration const& config)
+HistoryArchive::HistoryArchive(HistoryArchiveConfiguration const& config)
     : mConfig(config)
 {
 }

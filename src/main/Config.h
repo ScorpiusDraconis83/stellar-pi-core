@@ -37,24 +37,39 @@ enum class ValidationThresholdLevels : int
     ALL_REQUIRED = 2
 };
 
+enum class ValidatorQuality : int
+{
+    VALIDATOR_LOW_QUALITY = 0,
+    VALIDATOR_MED_QUALITY = 1,
+    VALIDATOR_HIGH_QUALITY = 2,
+    VALIDATOR_CRITICAL_QUALITY = 3
+};
+
+struct ValidatorEntry
+{
+    std::string mName;
+    std::string mHomeDomain;
+    ValidatorQuality mQuality;
+    PublicKey mKey;
+    bool mHasHistory;
+};
+
+// This struct holds information necessary to compute the weight of a validator
+// for leader election
+struct ValidatorWeightConfig
+{
+    // Mapping from node ids to info about each validator
+    UnorderedMap<NodeID, ValidatorEntry> mValidatorEntries;
+
+    // Mapping from org names to the number of validators in that org
+    UnorderedMap<std::string, uint64> mHomeDomainSizes;
+
+    // Weights for each quality level
+    UnorderedMap<ValidatorQuality, uint64> mQualityWeights;
+};
+
 class Config : public std::enable_shared_from_this<Config>
 {
-    enum class ValidatorQuality : int
-    {
-        VALIDATOR_LOW_QUALITY = 0,
-        VALIDATOR_MED_QUALITY = 1,
-        VALIDATOR_HIGH_QUALITY = 2,
-        VALIDATOR_CRITICAL_QUALITY = 3
-    };
-
-    struct ValidatorEntry
-    {
-        std::string mName;
-        std::string mHomeDomain;
-        ValidatorQuality mQuality;
-        PublicKey mKey;
-        bool mHasHistory;
-    };
 
     void validateConfig(ValidationThresholdLevels thresholdLevel);
     void loadQset(std::shared_ptr<cpptoml::table> group, SCPQuorumSet& qset,
@@ -111,6 +126,11 @@ class Config : public std::enable_shared_from_this<Config>
                                    std::string const& valuesName,
                                    std::string const& distributionName);
 
+    // Sets VALIDATOR_WEIGHT_CONFIG based on the content of `validators`. No-op
+    // if this node is not a validator.
+    void
+    setValidatorWeightConfig(std::vector<ValidatorEntry> const& validators);
+
   public:
     static const uint32 CURRENT_LEDGER_PROTOCOL_VERSION;
 
@@ -123,31 +143,24 @@ class Config : public std::enable_shared_from_this<Config>
     //    via applying valid TXs or manually adding entries to the BucketList.
     //    BucketList state is not preserved over restarts. If this mode can be
     //    used, it should be.
-    // 2. TESTDB_IN_MEMORY_NO_OFFERS: allows arbitrary ledger state writes via
-    //    ltx root commits, but does not test the offers table. Suitable for
+    // 2. TESTDB_IN_MEMORY: allows arbitrary ledger state writes via
+    //    ltx root commits. Suitable for
     //    tests that required writes to the ledger state that cannot be achieved
     //    via valid TX application, such as testing invalid TX error codes or
     //    low level op testing.
-    // 3. TESTDB_IN_MEMORY_OFFERS: The same as TESTDB_IN_MEMORY_NO_OFFERS, but
-    //    tests the offers table. Suitable for testing ops that interact with
-    //    offers.
-    // 4. TESTDB_ON_DISK_SQLITE: Should only be used to test SQLITE specific
+    // 3. TESTDB_POSTGRESQL: Should only be used to test POSTGRESQL specific
     //    database operations.
-    // 5. TESTDB_POSTGRESQL: Should only be used to test POSTGRESQL specific
-    //    database operations.
-    // 6. TESTDB_BUCKET_DB_PERSISTENT: Same as TESTDB_BUCKET_DB_VOLATILE, but
-    //    persists the BucketList over restart. This mode is very slow and
-    //    should only be used for testing restart behavior or some low level
-    //    BucketList features.
+    // 4. TESTDB_BUCKET_DB_PERSISTENT: Same as TESTDB_BUCKET_DB_VOLATILE, but
+    //    persists the BucketList and SQL DB over restart. This mode is very
+    //    slow and should only be used for testing restart behavior or some low
+    //    level BucketList features or for testing SQLite DB specific behavior.
     enum TestDbMode
     {
         TESTDB_DEFAULT,
-        TESTDB_IN_MEMORY_OFFERS,
-        TESTDB_ON_DISK_SQLITE,
+        TESTDB_IN_MEMORY,
 #ifdef USE_POSTGRES
         TESTDB_POSTGRESQL,
 #endif
-        TESTDB_IN_MEMORY_NO_OFFERS,
         TESTDB_BUCKET_DB_VOLATILE,
         TESTDB_BUCKET_DB_PERSISTENT,
         TESTDB_MODES
@@ -183,6 +196,13 @@ class Config : public std::enable_shared_from_this<Config>
     // If you want, say, a week of history, set this to 120000.
     uint32_t CATCHUP_RECENT;
 
+#ifdef BUILD_TESTS
+    // Mode for "accelerated" catchup. If set to true, the node will skip
+    // application of failed transactions and will not verify signatures of
+    // successful transactions.
+    bool CATCHUP_SKIP_KNOWN_RESULTS_FOR_TESTING;
+#endif // BUILD_TESTS
+
     // Interval between automatic maintenance executions
     std::chrono::seconds AUTOMATIC_MAINTENANCE_PERIOD;
 
@@ -198,6 +218,19 @@ class Config : public std::enable_shared_from_this<Config>
     // option only exists for stress-testing and should not be enabled in
     // production networks.
     bool ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING;
+
+    // Path to pre-generated transaction file for LoadGenerator's
+    // PAY_PREGENERATED mode
+    std::string LOADGEN_PREGENERATED_TRANSACTIONS_FILE;
+
+    // A temporary config paramter that when enabled causes the protocol
+    // upgrades to also update the Soroban cost calibration. This will result
+    // in loadgen reflecting more accurate costs and match the real network.
+    // This also makes the node unable to catchup with the real traffic and
+    // thus should only be used in tests that only use loadgen.
+    // This can be defaulted to 'true' and then removed once the stable Core
+    // build supports the new logic.
+    bool UPDATE_SOROBAN_COSTS_DURING_PROTOCOL_UPGRADE_FOR_TESTING;
 
     // A config parameter that reduces ledger close time to 1s and checkpoint
     // frequency to every 8 ledgers. Do not ever set this in production, as it
@@ -215,9 +248,9 @@ class Config : public std::enable_shared_from_this<Config>
     bool ARTIFICIALLY_PESSIMIZE_MERGES_FOR_TESTING;
 
     // A config parameter that avoids counting level 0 merge events and those
-    // within Bucket::fresh; this option exists only for calculating adjustments
-    // to the expected count of merges when stopping and resuming merges,
-    // and should be false in all normal cases.
+    // within LiveBucket::fresh; this option exists only for calculating
+    // adjustments to the expected count of merges when stopping and resuming
+    // merges, and should be false in all normal cases.
     bool ARTIFICIALLY_REDUCE_MERGE_COUNTS_FOR_TESTING;
 
     // A config parameter that skips adjustment of target outbound connections
@@ -241,6 +274,11 @@ class Config : public std::enable_shared_from_this<Config>
     // picked up from the scheduler. This is useful to imitate a "slow" node.
     // This config should only be enabled when testing.
     std::chrono::microseconds ARTIFICIALLY_SLEEP_MAIN_THREAD_FOR_TESTING;
+
+    // A config parameter that forces stellar-core to sleep every time it closes
+    // a ledger if order to simulate slow application. This config should only
+    // be enabled when testing.
+    std::chrono::milliseconds ARTIFICIALLY_DELAY_LEDGER_CLOSE_FOR_TESTING;
 
     // Timeout before publishing externalized values to archive
     std::chrono::seconds PUBLISH_TO_ARCHIVE_DELAY;
@@ -288,8 +326,68 @@ class Config : public std::enable_shared_from_this<Config>
 
     // Instructions per transaction for SOROBAN_INVOKE and MIX_CLASSIC_SOROBAN
     // loadgen modes
-    std::vector<uint64_t> LOADGEN_INSTRUCTIONS_FOR_TESTING;
+    // Also used for configuring apply-load command.
+    std::vector<uint32_t> LOADGEN_INSTRUCTIONS_FOR_TESTING;
     std::vector<uint32_t> LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING;
+
+    // apply-load-specific configuration parameters:
+    // Size of the synthetic contract data entries used in apply-load.
+    // Currently we generate entries of the equal size for more precise
+    // control over the modelled instructions.
+    uint32_t APPLY_LOAD_DATA_ENTRY_SIZE_FOR_TESTING = 0;
+
+    // The parameters below control the synthetic bucket list generation in
+    // apply-load.
+
+    // Number of ledgers to simulate in apply-load. The more ledgers there are,
+    // the more bucket list levels will be populated.
+    uint32_t APPLY_LOAD_BL_SIMULATED_LEDGERS = 1000;
+    // Write a batch of entries every that many ledgers.
+    uint32_t APPLY_LOAD_BL_WRITE_FREQUENCY = 1000;
+    // Number of entries to write in every batch.
+    uint32_t APPLY_LOAD_BL_BATCH_SIZE = 1000;
+    // The final `APPLY_LOAD_BL_LAST_BATCH_LEDGERS` of synthetic load will each
+    // have `APPLY_LOAD_BL_LAST_BATCH_SIZE` entries in order to populate the
+    // lowest BL levels.
+    uint32_t APPLY_LOAD_BL_LAST_BATCH_LEDGERS = 300;
+    // Number of entries to write in every ledger of
+    // `APPLY_LOAD_BL_LAST_BATCH_LEDGERS`.
+    uint32_t APPLY_LOAD_BL_LAST_BATCH_SIZE = 100;
+
+    // The APPLY_LOAD_* parameters below are for initializing Soroban
+    // settings before applying the benchmark transactions.
+    uint32_t APPLY_LOAD_LEDGER_MAX_INSTRUCTIONS = 0;
+    uint32_t APPLY_LOAD_TX_MAX_INSTRUCTIONS = 0;
+
+    uint32_t APPLY_LOAD_LEDGER_MAX_READ_LEDGER_ENTRIES = 0;
+    uint32_t APPLY_LOAD_TX_MAX_READ_LEDGER_ENTRIES = 0;
+
+    uint32_t APPLY_LOAD_LEDGER_MAX_WRITE_LEDGER_ENTRIES = 0;
+    uint32_t APPLY_LOAD_TX_MAX_WRITE_LEDGER_ENTRIES = 0;
+
+    uint32_t APPLY_LOAD_LEDGER_MAX_READ_BYTES = 0;
+    uint32_t APPLY_LOAD_TX_MAX_READ_BYTES = 0;
+
+    uint32_t APPLY_LOAD_LEDGER_MAX_WRITE_BYTES = 0;
+    uint32_t APPLY_LOAD_TX_MAX_WRITE_BYTES = 0;
+
+    uint32_t APPLY_LOAD_MAX_TX_SIZE_BYTES = 0;
+    uint32_t APPLY_LOAD_MAX_LEDGER_TX_SIZE_BYTES = 0;
+
+    uint32_t APPLY_LOAD_MAX_CONTRACT_EVENT_SIZE_BYTES = 0;
+    uint32_t APPLY_LOAD_MAX_TX_COUNT = 0;
+
+    // Number of read-only and read-write entries in the apply-load
+    // transactions. Every entry will have
+    // `APPLY_LOAD_DATA_ENTRY_SIZE_FOR_TESTING` size.
+    std::vector<uint32_t> APPLY_LOAD_NUM_RO_ENTRIES_FOR_TESTING;
+    std::vector<uint32_t> APPLY_LOAD_NUM_RO_ENTRIES_DISTRIBUTION_FOR_TESTING;
+    std::vector<uint32_t> APPLY_LOAD_NUM_RW_ENTRIES_FOR_TESTING;
+    std::vector<uint32_t> APPLY_LOAD_NUM_RW_ENTRIES_DISTRIBUTION_FOR_TESTING;
+
+    // Number of events to generate in the apply-load transactions.
+    std::vector<uint32_t> APPLY_LOAD_EVENT_COUNT_FOR_TESTING;
+    std::vector<uint32_t> APPLY_LOAD_EVENT_COUNT_DISTRIBUTION_FOR_TESTING;
 
     // Waits for merges to complete before applying transactions during catchup
     bool CATCHUP_WAIT_MERGES_TX_APPLY_FOR_TESTING;
@@ -357,25 +455,21 @@ class Config : public std::enable_shared_from_this<Config>
     // be set to `false` only for testing purposes.
     bool MODE_ENABLES_BUCKETLIST;
 
-    // A config parameter that uses a never-committing ledger. This means that
-    // all ledger entries will be kept in memory, and not persisted to DB
-    // (relevant tables won't even be created). This should not be set for
-    // production validators.
-    bool MODE_USES_IN_MEMORY_LEDGER;
-
     // A config parameter that can be set to true (in a captive-core
     // configuration) to delay emitting metadata by one ledger.
     bool EXPERIMENTAL_PRECAUTION_DELAY_META;
-
-    // A config parameter that when set uses SQL as the primary
-    // key-value store for LedgerEntry lookups instead of BucketListDB.
-    bool DEPRECATED_SQL_LEDGER_STATE;
 
     // Page size exponent used by BucketIndex when indexing ranges of
     // BucketEntry's. If set to 0, BucketEntry's are individually indexed.
     // Otherwise, pageSize ==
     // 2^BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT.
     size_t BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT;
+
+    // Memory used for caching entries by BucketListDB when Bucket size is
+    // larger than BUCKETLIST_DB_INDEX_CUTOFF, in MB. Note that this value does
+    // not impact Buckets smaller than BUCKETLIST_DB_INDEX_CUTOFF, as they are
+    // always completely held in memory. If set to 0, caching is disabled.
+    size_t BUCKETLIST_DB_MEMORY_FOR_CACHING;
 
     // Size, in MB, determining whether a bucket should have an individual
     // key index or a key range index. If bucket size is below this value, range
@@ -385,7 +479,10 @@ class Config : public std::enable_shared_from_this<Config>
     size_t BUCKETLIST_DB_INDEX_CUTOFF;
 
     // Enable parallel processing of overlay operations (experimental)
-    bool EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING;
+    bool BACKGROUND_OVERLAY_PROCESSING;
+
+    // Enable parallel block application (experimental)
+    bool EXPERIMENTAL_PARALLEL_LEDGER_APPLY;
 
     // When set to true, BucketListDB indexes are persisted on-disk so that the
     // BucketList does not need to be reindexed on startup. Defaults to true.
@@ -395,16 +492,9 @@ class Config : public std::enable_shared_from_this<Config>
     // persisted.
     bool BUCKETLIST_DB_PERSIST_INDEX;
 
-    // When set to true, eviction scans occur on the background thread,
-    // increasing performance. Requires EXPERIMENTAL_BUCKETLIST_DB.
-    bool BACKGROUND_EVICTION_SCAN;
-
     // A config parameter that stores historical data, such as transactions,
     // fees, and scp history in the database
     bool MODE_STORES_HISTORY_MISC;
-
-    // A config parameter that stores ledger headers in the database
-    bool MODE_STORES_HISTORY_LEDGERHEADERS;
 
     // A config parameter that controls whether core automatically catches up
     // when it has buffered enough input; if false an out-of-sync node will
@@ -424,6 +514,10 @@ class Config : public std::enable_shared_from_this<Config>
     // Set to use config file values for genesis ledger
     // not setable in config file - only tests are allowed to do this
     bool USE_CONFIG_FOR_GENESIS;
+
+    // Number of test accounts to create in genesis ledger. This is useful for
+    // load testing.
+    uint32_t GENESIS_TEST_ACCOUNT_COUNT;
 
     // This is the number of failures you want to be able to tolerate.
     // You will need at least 3f+1 nodes in your quorum set.
@@ -479,9 +573,6 @@ class Config : public std::enable_shared_from_this<Config>
     // serious error; they should only be reduced or disabled if disk space is
     // at a premium.
     uint32_t METADATA_DEBUG_LEDGERS;
-
-    // Set of cursors added at each startup with value '1'.
-    std::vector<std::string> KNOWN_CURSORS;
 
     // maximum protocol version supported by the application, can be overridden
     // in tests
@@ -602,6 +693,15 @@ class Config : public std::enable_shared_from_this<Config>
 
     std::map<std::string, std::string> VALIDATOR_NAMES;
 
+    // Information necessary to compute the weight of a validator for leader
+    // election. Nullopt if this node is not a validator, or if this node is
+    // using manual quorum set configuration.
+    std::optional<ValidatorWeightConfig> VALIDATOR_WEIGHT_CONFIG;
+
+    // Revert to the old, application-agnostic nomination weight function for
+    // SCP leader election.
+    bool FORCE_OLD_STYLE_LEADER_ELECTION;
+
     // History config
     std::map<std::string, HistoryArchiveConfiguration> HISTORY;
 
@@ -668,6 +768,18 @@ class Config : public std::enable_shared_from_this<Config>
     // case.  This is used right now in the signal handler to exit() instead of
     // doing a graceful shutdown
     bool TEST_CASES_ENABLED;
+
+    // A config parameter that uses a never-committing ledger. This means that
+    // all ledger entries, except for offers, will be kept in memory, and not
+    // persisted to DB. Since offers are backed by SQL and not BucketListDB,
+    // offers are still commited to the SQL DB even when this mode is enabled.
+    // Should only be used for testing.
+    bool MODE_USES_IN_MEMORY_LEDGER;
+
+    // Set QUORUM_SET using automatic quorum set configuration based on
+    // `validators`.
+    void
+    generateQuorumSetForTesting(std::vector<ValidatorEntry> const& validators);
 #endif
 
 #ifdef BEST_OFFER_DEBUGGING
@@ -696,16 +808,10 @@ class Config : public std::enable_shared_from_this<Config>
 
     std::chrono::seconds getExpectedLedgerCloseTime() const;
 
-    void setInMemoryMode();
     bool modeDoesCatchupWithBucketList() const;
-    bool isInMemoryMode() const;
-    bool isInMemoryModeWithoutMinimalDB() const;
-    bool isUsingBucketListDB() const;
-    bool isUsingBackgroundEviction() const;
     bool isPersistingBucketListDBIndexes() const;
-    bool modeStoresAllHistory() const;
-    bool modeStoresAnyHistory() const;
-    void logBasicInfo();
+    void logBasicInfo() const;
+    bool parallelLedgerClose() const;
     void setNoListen();
     void setNoPublish();
 

@@ -83,20 +83,22 @@ for smaller memory overhead.
 Because the `BucketIndex`'s must be in memory, there is a tradeoff between BucketList
 lookup speed and memory overhead. The following configuration flags control these options:
 
-- `DEPRECATED_SQL_LEDGER_STATE`
-  - When set to false, the `BucketList` is indexed and used for ledger entry lookup
 - `BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT`
   - Page size used for `RangeIndex`, where `pageSize ==
     2^BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT`.
     Larger values slow down lookup speed but
     decrease memory usage.
 - `BUCKETLIST_DB_INDEX_CUTOFF`
-  - Bucket file size, in MB, that determines wether the `IndividualIndex` or
-   `RangeIndex` is used.
-    Default value is 20 MB, which indexes the first ~3 levels with the `IndividualIndex`.
+  - Bucket file size, in MB, that determines whether Bucket is cached in memory or not.
+    Default value is 250 MB, which indexes the first ~5 levels with the `IndividualIndex`.
     Larger values speed up lookups but increase memory usage.
 - `BUCKETLIST_DB_PERSIST_INDEX`
   - When set to true, BucketListDB indexes are saved to disk to avoid reindexing
     on startup. Defaults to true, should only be set to false for testing purposes.
     Validators do not currently support persisted indexes. If NODE_IS_VALIDATOR=true,
     this value is ignored and indexes are never persisted.
+- `BUCKETLIST_DB_MEMORY_FOR_CACHING`
+  - Memory used for caching entries by BucketListDB when Bucket size is larger
+    than `BUCKETLIST_DB_INDEX_CUTOFF`, in MB. Note that this value does not impact
+    Buckets smaller than `BUCKETLIST_DB_INDEX_CUTOFF`, as they are always
+    completely held in memory.

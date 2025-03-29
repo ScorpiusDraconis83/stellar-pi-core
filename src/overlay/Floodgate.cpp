@@ -56,10 +56,10 @@ Floodgate::clearBelow(uint32_t maxLedger)
 }
 
 bool
-Floodgate::addRecord(StellarMessage const& msg, Peer::pointer peer, Hash& index)
+Floodgate::addRecord(StellarMessage const& msg, Peer::pointer peer,
+                     Hash const& index)
 {
     ZoneScoped;
-    index = xdrBlake2(msg);
     if (mShuttingDown)
     {
         return false;
@@ -84,8 +84,7 @@ Floodgate::addRecord(StellarMessage const& msg, Peer::pointer peer, Hash& index)
 // send message to anyone you haven't gotten it from
 bool
 Floodgate::broadcast(std::shared_ptr<StellarMessage const> msg,
-                     std::optional<Hash> const& hash,
-                     uint32_t minOverlayVersion)
+                     std::optional<Hash> const& hash)
 {
     ZoneScoped;
     if (mShuttingDown)
@@ -124,12 +123,6 @@ Floodgate::broadcast(std::shared_ptr<StellarMessage const> msg,
         // Assert must hold since only main thread is allowed to modify
         // authenticated peers and peer state during drop
         peer.second->assertAuthenticated();
-        if (peer.second->getRemoteOverlayVersion() < minOverlayVersion)
-        {
-            // Skip peers running overlay versions that are older than
-            // `minOverlayVersion`.
-            continue;
-        }
 
         bool pullMode = msg->type() == TRANSACTION;
 
@@ -145,21 +138,29 @@ Floodgate::broadcast(std::shared_ptr<StellarMessage const> msg,
             else
             {
                 mSendFromBroadcast.Mark();
-                std::weak_ptr<Peer> weak(
-                    std::static_pointer_cast<Peer>(peer.second));
-                // This is an async operation, and peer might get dropped by the
-                // time we actually try to send the message. This is fine, as
-                // sendMessage will just be a no-op in that case
-                mApp.postOnMainThread(
-                    [msg, weak, log = !broadcasted]() {
-                        auto strong = weak.lock();
-                        if (strong)
-                        {
-                            strong->sendMessage(msg, log);
-                        }
-                    },
-                    fmt::format(FMT_STRING("broadcast to {}"),
-                                peer.second->toString()));
+
+                if (msg->type() == SCP_MESSAGE)
+                {
+                    peer.second->sendMessage(msg, !broadcasted);
+                }
+                else
+                {
+                    // This is an async operation, and peer might get dropped by
+                    // the time we actually try to send the message. This is
+                    // fine, as sendMessage will just be a no-op in that case
+                    std::weak_ptr<Peer> weak(
+                        std::static_pointer_cast<Peer>(peer.second));
+                    mApp.postOnMainThread(
+                        [msg, weak, log = !broadcasted]() {
+                            auto strong = weak.lock();
+                            if (strong)
+                            {
+                                strong->sendMessage(msg, log);
+                            }
+                        },
+                        fmt::format(FMT_STRING("broadcast to {}"),
+                                    peer.second->toString()));
+                }
             }
             broadcasted = true;
         }

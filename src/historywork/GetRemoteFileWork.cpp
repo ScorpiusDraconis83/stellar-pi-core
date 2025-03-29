@@ -38,10 +38,14 @@ GetRemoteFileWork::getCommand()
     {
         mCurrentArchive = mApp.getHistoryArchiveManager()
                               .selectRandomReadableHistoryArchive();
+        CLOG_INFO(History, "Selected archive {} to download {}",
+                  mCurrentArchive->getName(),
+                  std::filesystem::path(mRemote).filename().string());
     }
     releaseAssert(mCurrentArchive);
     releaseAssert(mCurrentArchive->hasGetCmd());
     auto cmdLine = mCurrentArchive->getFileCmd(mRemote, mLocal);
+    CLOG_DEBUG(History, "Downloading file: cmd: {}", cmdLine);
 
     return CommandInfo{cmdLine, std::string()};
 }
@@ -66,9 +70,9 @@ GetRemoteFileWork::onFailureRaise()
 {
     releaseAssert(mCurrentArchive);
     mFailuresPerSecond.Mark(1);
-    CLOG_ERROR(History,
-               "Could not download file: archive {} maybe missing file {}",
-               mCurrentArchive->getName(), mRemote);
+    CLOG_WARNING(History,
+                 "Could not download file: archive {} maybe missing file {}",
+                 mCurrentArchive->getName(), mRemote);
     RunCommandWork::onFailureRaise();
 }
 

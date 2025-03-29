@@ -33,6 +33,7 @@
 #include "transactions/SetTrustLineFlagsOpFrame.h"
 #include "transactions/TransactionFrame.h"
 #include "transactions/TransactionUtils.h"
+#include "util/GlobalChecks.h"
 #include "util/Logging.h"
 #include "util/ProtocolVersion.h"
 #include "util/XDRCereal.h"
@@ -135,7 +136,7 @@ OperationFrame::OperationFrame(Operation const& op,
 }
 
 bool
-OperationFrame::apply(Application& app, SignatureChecker& signatureChecker,
+OperationFrame::apply(AppConnector& app, SignatureChecker& signatureChecker,
                       AbstractLedgerTxn& ltx, Hash const& sorobanBasePrngSeed,
                       OperationResult& res,
                       std::shared_ptr<SorobanTxData> sorobanData) const
@@ -144,8 +145,11 @@ OperationFrame::apply(Application& app, SignatureChecker& signatureChecker,
     CLOG_TRACE(Tx, "{}", xdrToCerealString(mOperation, "Operation"));
 
     LedgerSnapshot ltxState(ltx);
-    bool applyRes =
-        checkValid(app, signatureChecker, ltxState, true, res, sorobanData);
+    std::optional<SorobanNetworkConfig> cfg =
+        isSoroban() ? std::make_optional(app.getSorobanNetworkConfigForApply())
+                    : std::nullopt;
+    bool applyRes = checkValid(app, signatureChecker, cfg, ltxState, true, res,
+                               sorobanData);
     if (applyRes)
     {
         applyRes = doApply(app, ltx, sorobanBasePrngSeed, res, sorobanData);
@@ -217,7 +221,9 @@ OperationFrame::getSourceID() const
 // make sure sig is correct
 // verifies that the operation is well formed (operation specific)
 bool
-OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
+OperationFrame::checkValid(AppConnector& app,
+                           SignatureChecker& signatureChecker,
+                           std::optional<SorobanNetworkConfig> const& cfg,
                            LedgerSnapshot const& ls, bool forApply,
                            OperationResult& res,
                            std::shared_ptr<SorobanTxData> sorobanData) const
@@ -225,8 +231,8 @@ OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
     ZoneScoped;
     bool validationResult = false;
     auto validate = [this, &res, forApply, &signatureChecker, &app,
-                     &sorobanData,
-                     &validationResult](LedgerSnapshot const& ls) {
+                     &sorobanData, &validationResult,
+                     &cfg](LedgerSnapshot const& ls) {
         if (!isOpSupported(ls.getLedgerHeader().current()))
         {
             res.code(opNOT_SUPPORTED);
@@ -261,12 +267,9 @@ OperationFrame::checkValid(Application& app, SignatureChecker& signatureChecker,
             isSoroban())
         {
             releaseAssertOrThrow(sorobanData);
-            auto const& sorobanConfig =
-                app.getLedgerManager().getSorobanNetworkConfig();
-
-            validationResult =
-                doCheckValidForSoroban(sorobanConfig, app.getConfig(),
-                                       ledgerVersion, res, *sorobanData);
+            releaseAssertOrThrow(cfg);
+            validationResult = doCheckValidForSoroban(
+                cfg.value(), app.getConfig(), ledgerVersion, res, *sorobanData);
         }
         else
         {
@@ -326,5 +329,12 @@ OperationFrame::insertLedgerKeysToPrefetch(UnorderedSet<LedgerKey>& keys) const
 {
     // Do nothing by default
     return;
+}
+
+SorobanResources const&
+OperationFrame::getSorobanResources() const
+{
+    releaseAssertOrThrow(isSoroban());
+    return mParentTx.sorobanResources();
 }
 }

@@ -31,12 +31,11 @@ FlowControl::getOutboundQueueByteLimit(
     return mAppConnector.getConfig().OUTBOUND_TX_QUEUE_BYTE_LIMIT;
 }
 
-FlowControl::FlowControl(OverlayAppConnector& connector,
-                         bool useBackgroundThread)
+FlowControl::FlowControl(AppConnector& connector, bool useBackgroundThread)
     : mFlowControlCapacity(connector.getConfig(), mNodeID)
     , mFlowControlBytesCapacity(
           connector.getConfig(), mNodeID,
-          connector.getOverlayManager().getFlowControlBytesConfig().mTotal)
+          connector.getOverlayManager().getFlowControlBytesTotal())
     , mOverlayMetrics(connector.getOverlayManager().getOverlayMetrics())
     , mAppConnector(connector)
     , mUseBackgroundThread(useBackgroundThread)
@@ -241,30 +240,35 @@ SendMoreCapacity
 FlowControl::endMessageProcessing(StellarMessage const& msg)
 {
     ZoneScoped;
-    releaseAssert(threadIsMain());
     std::lock_guard<std::mutex> guard(mFlowControlMutex);
 
     mFloodDataProcessed += mFlowControlCapacity.releaseLocalCapacity(msg);
     mFloodDataProcessedBytes +=
         mFlowControlBytesCapacity.releaseLocalCapacity(msg);
+    mTotalMsgsProcessed++;
 
     releaseAssert(mFloodDataProcessed <=
                   mAppConnector.getConfig().FLOW_CONTROL_SEND_MORE_BATCH_SIZE);
     bool shouldSendMore =
         mFloodDataProcessed ==
         mAppConnector.getConfig().FLOW_CONTROL_SEND_MORE_BATCH_SIZE;
-    auto const byteBatchSize = mAppConnector.getOverlayManager()
-                                   .getFlowControlBytesConfig()
-                                   .mBatchSize;
+    auto const byteBatchSize =
+        OverlayManager::getFlowControlBytesBatch(mAppConnector.getConfig());
     shouldSendMore =
         shouldSendMore || mFloodDataProcessedBytes >= byteBatchSize;
 
-    SendMoreCapacity res{0, 0};
+    SendMoreCapacity res{0, 0, 0};
+    if (mTotalMsgsProcessed == mAppConnector.getConfig().PEER_READING_CAPACITY)
+    {
+        res.numTotalMessages = mTotalMsgsProcessed;
+        mTotalMsgsProcessed = 0;
+    }
+
     if (shouldSendMore)
     {
         // First save result to return
-        res.first = mFloodDataProcessed;
-        res.second = mFloodDataProcessedBytes;
+        res.numFloodMessages = mFloodDataProcessed;
+        res.numFloodBytes = mFloodDataProcessedBytes;
 
         // Reset counters
         mFloodDataProcessed = 0;
@@ -557,21 +561,16 @@ FlowControl::maybeThrottleRead()
     return false;
 }
 
-bool
+void
 FlowControl::stopThrottling()
 {
     std::lock_guard<std::mutex> guard(mFlowControlMutex);
-    releaseAssert(threadIsMain());
-    if (mLastThrottle)
-    {
-        CLOG_DEBUG(Overlay, "Stop throttling reading from peer {}",
-                   mAppConnector.getConfig().toShortString(mNodeID));
-        mOverlayMetrics.mConnectionReadThrottle.Update(mAppConnector.now() -
-                                                       *mLastThrottle);
-        mLastThrottle.reset();
-        return true;
-    }
-    return false;
+    releaseAssert(mLastThrottle);
+    CLOG_DEBUG(Overlay, "Stop throttling reading from peer {}",
+               mAppConnector.getConfig().toShortString(mNodeID));
+    mOverlayMetrics.mConnectionReadThrottle.Update(mAppConnector.now() -
+                                                   *mLastThrottle);
+    mLastThrottle.reset();
 }
 
 bool

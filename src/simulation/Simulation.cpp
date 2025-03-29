@@ -41,7 +41,7 @@ Simulation::Simulation(Mode mode, Hash const& networkID, ConfigGen confGen,
     , mQuorumSetAdjuster(qSetAdjust)
 {
     auto cfg = newConfig();
-    auto& parallel = cfg.EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING;
+    auto& parallel = cfg.BACKGROUND_OVERLAY_PROCESSING;
     parallel = parallel && mVirtualClockMode == VirtualClock::REAL_TIME;
     mIdleApp = Application::create(mClock, cfg);
     mPeerMap.emplace(mIdleApp->getConfig().PEER_PORT, mIdleApp);
@@ -91,15 +91,14 @@ Simulation::setCurrentVirtualTime(VirtualClock::system_time_point t)
 
 Application::pointer
 Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
-                    bool newDB, uint32_t startAtLedger,
-                    std::string const& startAtHash)
+                    bool newDB)
 {
     auto cfg = cfg2 ? std::make_shared<Config>(*cfg2)
                     : std::make_shared<Config>(newConfig());
     cfg->adjust();
     cfg->NODE_SEED = nodeKey;
     cfg->MANUAL_CLOSE = false;
-    auto& parallel = cfg->EXPERIMENTAL_BACKGROUND_OVERLAY_PROCESSING;
+    auto& parallel = cfg->BACKGROUND_OVERLAY_PROCESSING;
     parallel = parallel && mVirtualClockMode == VirtualClock::REAL_TIME;
 
     if (mQuorumSetAdjuster)
@@ -125,23 +124,16 @@ Simulation::addNode(SecretKey nodeKey, SCPQuorumSet qSet, Config const* cfg2,
     }
 
     Application::pointer app;
-    if (newDB)
+    if (mMode == OVER_LOOPBACK)
     {
-        if (mMode == OVER_LOOPBACK)
-        {
-            app =
-                createTestApplication<ApplicationLoopbackOverlay, Simulation&>(
-                    *clock, *cfg, *this, newDB, false);
-        }
-        else
-        {
-            app = createTestApplication(*clock, *cfg, newDB, false);
-        }
+        app = createTestApplication<ApplicationLoopbackOverlay, Simulation&>(
+            *clock, *cfg, *this, newDB, false);
     }
     else
     {
-        app = setupApp(*cfg, *clock, startAtLedger, startAtHash);
+        app = createTestApplication(*clock, *cfg, newDB, false);
     }
+
     mNodes.emplace(nodeKey.getPublicKey(), Node{clock, app});
 
     mPeerMap.emplace(app->getConfig().PEER_PORT,

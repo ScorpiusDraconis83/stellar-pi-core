@@ -25,6 +25,8 @@ class Timer;
 
 namespace stellar
 {
+constexpr uint32 const SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER = 2;
+
 class Application;
 class LedgerManager;
 class HerderSCPDriver;
@@ -73,7 +75,8 @@ class HerderImpl : public Herder
 
     void start() override;
 
-    void lastClosedLedgerIncreased(bool latest) override;
+    void lastClosedLedgerIncreased(bool latest,
+                                   TxSetXDRFrameConstPtr txSet) override;
 
     SCP& getSCP();
     HerderSCPDriver&
@@ -94,9 +97,15 @@ class HerderImpl : public Herder
                            bool isLatestSlot);
     void emitEnvelope(SCPEnvelope const& envelope);
 
+#ifdef BUILD_TESTS
+    TransactionQueue::AddResult
+    recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf,
+                    bool isLoadgenTx = false) override;
+#else
     TransactionQueue::AddResult
     recvTransaction(TransactionFrameBasePtr tx,
                     bool submittedFromSelf) override;
+#endif
 
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) override;
 #ifdef BUILD_TESTS
@@ -192,6 +201,8 @@ class HerderImpl : public Herder
     makeStellarValue(Hash const& txSetHash, uint64_t closeTime,
                      xdr::xvector<UpgradeType, 6> const& upgrades,
                      SecretKey const& s) override;
+
+    virtual void beginApply() override;
 
     void startTxSetGCTimer();
 

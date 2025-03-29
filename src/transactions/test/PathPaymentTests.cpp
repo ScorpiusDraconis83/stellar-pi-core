@@ -70,7 +70,7 @@ assetPathToString(const std::deque<Asset>& assets)
 
 TEST_CASE_VERSIONS("pathpayment", "[tx][pathpayment]")
 {
-    auto const& cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY_OFFERS);
+    auto const& cfg = getTestConfig(0, Config::TESTDB_IN_MEMORY);
 
     VirtualClock clock;
     auto app = createTestApplication(clock, cfg);
@@ -4435,8 +4435,9 @@ TEST_CASE_VERSIONS("pathpayment", "[tx][pathpayment]")
 
             LedgerTxn ltx(app->getLedgerTxnRoot());
             TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
-            REQUIRE(tx->checkValidForTesting(*app, ltx, 0, 0, 0));
-            REQUIRE(tx->apply(*app, ltx, txm));
+            REQUIRE(
+                tx->checkValidForTesting(app->getAppConnector(), ltx, 0, 0, 0));
+            REQUIRE(tx->apply(app->getAppConnector(), ltx, txm));
             ltx.commit();
         };
 
@@ -4828,8 +4829,9 @@ TEST_CASE_VERSIONS("pathpayment", "[tx][pathpayment]")
                 LedgerTxn ltx(app->getLedgerTxnRoot());
                 TransactionMetaFrame txm(
                     ltx.loadHeader().current().ledgerVersion);
-                REQUIRE(tx->checkValidForTesting(*app, ltx, 0, 0, 0));
-                REQUIRE(tx->apply(*app, ltx, txm));
+                REQUIRE(tx->checkValidForTesting(app->getAppConnector(), ltx, 0,
+                                                 0, 0));
+                REQUIRE(tx->apply(app->getAppConnector(), ltx, txm));
                 ltx.commit();
             }
 

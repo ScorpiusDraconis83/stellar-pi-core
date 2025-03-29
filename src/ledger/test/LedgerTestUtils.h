@@ -6,6 +6,8 @@
 
 #include "history/HistoryManager.h"
 #include "overlay/StellarXDR.h"
+#include "util/UnorderedSet.h"
+#include "util/types.h"
 
 namespace stellar
 {
@@ -45,6 +47,10 @@ std::vector<LedgerEntry> generateValidUniqueLedgerEntries(size_t n);
 std::vector<LedgerKey> generateValidLedgerEntryKeysWithExclusions(
     std::unordered_set<LedgerEntryType> const& excludedTypes, size_t n);
 
+std::vector<LedgerKey> generateValidUniqueLedgerKeysWithTypes(
+    std::unordered_set<LedgerEntryType> const& types, size_t n,
+    UnorderedSet<LedgerKey>& seenKeys);
+
 std::vector<LedgerKey> generateUniqueValidSorobanLedgerEntryKeys(size_t n);
 
 std::vector<LedgerKey> generateValidUniqueLedgerEntryKeysWithExclusions(
@@ -62,6 +68,10 @@ LedgerEntry generateValidLedgerEntryWithTypes(
     std::unordered_set<LedgerEntryType> const& types, size_t b = 3);
 std::vector<LedgerEntry> generateValidUniqueLedgerEntriesWithTypes(
     std::unordered_set<LedgerEntryType> const& types, size_t n);
+
+std::vector<LedgerEntry> generateValidUniqueLedgerEntriesWithTypes(
+    std::unordered_set<LedgerEntryType> const& types, size_t n,
+    UnorderedSet<LedgerKey>& seenKeys);
 
 AccountEntry generateValidAccountEntry(size_t b = 3);
 std::vector<AccountEntry> generateValidAccountEntries(size_t n);

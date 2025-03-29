@@ -125,7 +125,12 @@ class TransactionQueue
     static std::vector<AssetPair>
     findAllAssetPairsInvolvedInPaymentLoops(TransactionFrameBasePtr tx);
 
+#ifdef BUILD_TESTS
+    AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf,
+                     bool isLoadgenTx = false);
+#else
     AddResult tryAdd(TransactionFrameBasePtr tx, bool submittedFromSelf);
+#endif
     void removeApplied(Transactions const& txs);
     // Ban transactions that are no longer valid or have insufficient fee;
     // transaction per account limit applies here, so `txs` should have no
@@ -143,7 +148,7 @@ class TransactionQueue
 
     bool isBanned(Hash const& hash) const;
     TransactionFrameBaseConstPtr getTx(Hash const& hash) const;
-    TxSetTransactions getTransactions(LedgerHeader const& lcl) const;
+    TxFrameList getTransactions(LedgerHeader const& lcl) const;
     bool sourceAccountPending(AccountID const& accountID) const;
 
     virtual size_t getMaxQueueSizeOps() const = 0;
@@ -181,18 +186,29 @@ class TransactionQueue
     {
         QueueMetrics(std::vector<medida::Counter*> sizeByAge,
                      medida::Counter& bannedTransactionsCounter,
-                     medida::Timer& transactionsDelay,
-                     medida::Timer& transactionsSelfDelay)
+                     medida::Counter& transactionsDelayAccumulator,
+                     medida::Counter& transactionsDelayCounter,
+                     medida::Counter& transactionsSelfDelayAccumulator,
+                     medida::Counter& transactionsSelfDelayCounter)
             : mSizeByAge(std::move(sizeByAge))
             , mBannedTransactionsCounter(bannedTransactionsCounter)
-            , mTransactionsDelay(transactionsDelay)
-            , mTransactionsSelfDelay(transactionsSelfDelay)
+            , mTransactionsDelayAccumulator(transactionsDelayAccumulator)
+            , mTransactionsSelfDelayAccumulator(
+                  transactionsSelfDelayAccumulator)
+            , mTransactionsDelayCounter(transactionsDelayCounter)
+            , mTransactionsSelfDelayCounter(transactionsSelfDelayCounter)
         {
         }
         std::vector<medida::Counter*> mSizeByAge;
         medida::Counter& mBannedTransactionsCounter;
-        medida::Timer& mTransactionsDelay;
-        medida::Timer& mTransactionsSelfDelay;
+
+        // Sum of total delay, in milliseconds
+        medida::Counter& mTransactionsDelayAccumulator;
+        medida::Counter& mTransactionsSelfDelayAccumulator;
+
+        // Count of transactions delay events
+        medida::Counter& mTransactionsDelayCounter;
+        medida::Counter& mTransactionsSelfDelayCounter;
     };
 
     std::unique_ptr<QueueMetrics> mQueueMetrics;
@@ -219,9 +235,16 @@ class TransactionQueue
     };
     BroadcastStatus broadcastTx(TimestampedTx& tx);
 
+#ifdef BUILD_TESTS
+    TransactionQueue::AddResult
+    canAdd(TransactionFrameBasePtr tx, AccountStates::iterator& stateIter,
+           std::vector<std::pair<TransactionFrameBasePtr, bool>>& txsToEvict,
+           bool isLoadgenTx = false);
+#else
     TransactionQueue::AddResult
     canAdd(TransactionFrameBasePtr tx, AccountStates::iterator& stateIter,
            std::vector<std::pair<TransactionFrameBasePtr, bool>>& txsToEvict);
+#endif
 
     void releaseFeeMaybeEraseAccountState(TransactionFrameBasePtr tx);
 

@@ -9,6 +9,7 @@
 #include "test/TxTests.h"
 #include "test/test.h"
 #include "work/WorkScheduler.h"
+#include <limits>
 
 namespace stellar
 {
@@ -36,6 +37,30 @@ crankFor(VirtualClock& clock, VirtualClock::duration duration)
 }
 
 void
+crankUntil(Application::pointer app, std::function<bool()> const& predicate,
+           VirtualClock::duration timeout)
+{
+    crankUntil(*app, predicate, timeout);
+}
+
+void
+crankUntil(Application& app, std::function<bool()> const& predicate,
+           VirtualClock::duration timeout)
+{
+    auto start = std::chrono::system_clock::now();
+    while (!predicate())
+    {
+        app.getClock().crank(false);
+        auto current = std::chrono::system_clock::now();
+        auto diff = current - start;
+        if (diff > timeout)
+        {
+            break;
+        }
+    }
+}
+
+void
 shutdownWorkScheduler(Application& app)
 {
     if (app.getClock().getIOContext().stopped())
@@ -47,23 +72,6 @@ shutdownWorkScheduler(Application& app)
     while (app.getWorkScheduler().getState() != BasicWork::State::WORK_ABORTED)
     {
         app.getClock().crank();
-    }
-}
-
-void
-injectSendPeersAndReschedule(VirtualClock::time_point& end, VirtualClock& clock,
-                             VirtualTimer& timer,
-                             LoopbackPeerConnection& connection)
-{
-    connection.getInitiator()->sendGetPeers();
-    if (clock.now() < end && connection.getInitiator()->isConnectedForTesting())
-    {
-        timer.expires_from_now(std::chrono::milliseconds(10));
-        timer.async_wait(
-            [&]() {
-                injectSendPeersAndReschedule(end, clock, timer, connection);
-            },
-            &VirtualTimer::onFailureNoop);
     }
 }
 
@@ -128,16 +136,21 @@ computeMultiplier(LedgerEntry const& le)
     }
 }
 
-BucketListDepthModifier::BucketListDepthModifier(uint32_t newDepth)
-    : mPrevDepth(BucketList::kNumLevels)
+template <class BucketT>
+BucketListDepthModifier<BucketT>::BucketListDepthModifier(uint32_t newDepth)
+    : mPrevDepth(BucketListBase<BucketT>::kNumLevels)
 {
-    BucketList::kNumLevels = newDepth;
+    BucketListBase<BucketT>::kNumLevels = newDepth;
 }
 
-BucketListDepthModifier::~BucketListDepthModifier()
+template <class BucketT>
+BucketListDepthModifier<BucketT>::~BucketListDepthModifier()
 {
-    BucketList::kNumLevels = mPrevDepth;
+    BucketListBase<BucketT>::kNumLevels = mPrevDepth;
 }
+
+template class BucketListDepthModifier<LiveBucket>;
+template class BucketListDepthModifier<HotArchiveBucket>;
 }
 
 TestInvariantManager::TestInvariantManager(medida::MetricsRegistry& registry)
@@ -197,7 +210,8 @@ genesis(int minute, int second)
 
 void
 upgradeSorobanNetworkConfig(std::function<void(SorobanNetworkConfig&)> modifyFn,
-                            std::shared_ptr<Simulation> simulation)
+                            std::shared_ptr<Simulation> simulation,
+                            bool applyUpgrade)
 {
     auto nodes = simulation->getNodes();
     auto& lg = nodes[0]->getLoadGenerator();
@@ -206,46 +220,50 @@ upgradeSorobanNetworkConfig(std::function<void(SorobanNetworkConfig&)> modifyFn,
     auto& complete =
         app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
     auto completeCount = complete.count();
-    // Only create an account if there are none aleady created.
-    uint32_t offset = 0;
-    if (app.getMetrics()
-            .NewMeter({"loadgen", "account", "created"}, "account")
-            .count() == 0)
+
+    // Use large offset to avoid conflicts with tests using loadgen.
+    auto const offset = std::numeric_limits<uint32_t>::max() - 1;
+
+    // Only create an account if upgrade has not ran before.
+    if (!simulation->isSetUpForSorobanUpgrade())
     {
         auto createAccountsLoadConfig =
             GeneratedLoadConfig::createAccountsLoad(1, 1);
-        offset = std::numeric_limits<uint32_t>::max() - 1;
         createAccountsLoadConfig.offset = offset;
 
         lg.generateLoad(createAccountsLoadConfig);
         simulation->crankUntil(
             [&]() { return complete.count() == completeCount + 1; },
             300 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
-    }
 
-    // Create upload wasm transaction.
-    auto createUploadCfg = GeneratedLoadConfig::createSorobanUpgradeSetupLoad();
-    createUploadCfg.offset = offset;
-    lg.generateLoad(createUploadCfg);
-    completeCount = complete.count();
-    simulation->crankUntil(
-        [&]() { return complete.count() == completeCount + 1; },
-        300 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+        // Create upload wasm transaction.
+        auto createUploadCfg =
+            GeneratedLoadConfig::createSorobanUpgradeSetupLoad();
+        createUploadCfg.offset = offset;
+        lg.generateLoad(createUploadCfg);
+        completeCount = complete.count();
+        simulation->crankUntil(
+            [&]() { return complete.count() == completeCount + 1; },
+            300 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+
+        simulation->markReadyForSorobanUpgrade();
+    }
 
     // Create upgrade transaction.
     auto createUpgradeLoadGenConfig = GeneratedLoadConfig::txLoad(
         LoadGenMode::SOROBAN_CREATE_UPGRADE, 1, 1, 1);
     createUpgradeLoadGenConfig.offset = offset;
     // Get current network config.
-    auto cfg = nodes[0]->getLedgerManager().getSorobanNetworkConfig();
+    auto cfg = nodes[0]->getLedgerManager().getLastClosedSorobanNetworkConfig();
     modifyFn(cfg);
     createUpgradeLoadGenConfig.copySorobanNetworkConfigToUpgradeConfig(cfg);
-    auto upgradeSetKey = lg.getConfigUpgradeSetKey(createUpgradeLoadGenConfig);
+    auto upgradeSetKey = lg.getConfigUpgradeSetKey(
+        createUpgradeLoadGenConfig.getSorobanUpgradeConfig());
     lg.generateLoad(createUpgradeLoadGenConfig);
     completeCount = complete.count();
     simulation->crankUntil(
         [&]() { return complete.count() == completeCount + 1; },
-        2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+        4 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
     // Arm for upgrade.
     for (auto app : nodes)
@@ -258,13 +276,18 @@ upgradeSorobanNetworkConfig(std::function<void(SorobanNetworkConfig&)> modifyFn,
         scheduledUpgrades.mConfigUpgradeSetKey = upgradeSetKey;
         app->getHerder().setUpgrades(scheduledUpgrades);
     }
-    // Wait for upgrade to be applied
-    simulation->crankUntil(
-        [&]() {
-            auto netCfg = app.getLedgerManager().getSorobanNetworkConfig();
-            return netCfg == cfg;
-        },
-        2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+
+    if (applyUpgrade)
+    {
+        // Wait for upgrade to be applied
+        simulation->crankUntil(
+            [&]() {
+                auto netCfg =
+                    app.getLedgerManager().getLastClosedSorobanNetworkConfig();
+                return netCfg == cfg;
+            },
+            2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+    }
 }
 
 void
@@ -276,15 +299,15 @@ modifySorobanNetworkConfig(Application& app,
         return;
     }
     LedgerTxn ltx(app.getLedgerTxnRoot());
-    app.getLedgerManager().updateNetworkConfig(ltx);
-    auto& cfg = app.getLedgerManager().getMutableSorobanNetworkConfig();
+    app.getLedgerManager().updateSorobanNetworkConfigForApply(ltx);
+    auto& cfg = app.getLedgerManager().getMutableSorobanNetworkConfigForApply();
     modifyFn(cfg);
     cfg.writeAllSettings(ltx, app);
     ltx.commit();
 
     // Need to close a ledger following call to `addBatch` from config upgrade
     // to refresh cached state
-    if (app.getConfig().isUsingBucketListDB())
+    if (!app.getConfig().MODE_USES_IN_MEMORY_LEDGER)
     {
         txtest::closeLedger(app);
     }
@@ -334,5 +357,47 @@ appProtocolVersionStartsFrom(Application& app, ProtocolVersion fromVersion)
     auto ledgerVersion = ltx.loadHeader().current().ledgerVersion;
 
     return protocolVersionStartsFrom(ledgerVersion, fromVersion);
+}
+
+void
+generateTransactions(Application& app, std::filesystem::path const& outputFile,
+                     uint32_t numTransactions, uint32_t accounts,
+                     uint32_t offset)
+{
+    // Create a TxGenerator for generating payment transactions
+    TxGenerator txgen(app);
+
+    // Open the output file for writing
+    std::remove(outputFile.c_str());
+    XDROutputFileStream out(app.getClock().getIOContext(), true);
+    out.open(outputFile);
+
+    if (accounts == 0)
+    {
+        throw std::runtime_error("Number of accounts must be greater than 0");
+    }
+
+    LOG_INFO(DEFAULT_LOG,
+             "Generating {} payment transactions using {} accounts with offset "
+             "{}...",
+             numTransactions, accounts, offset);
+
+    // Loop through accounts to create payment transactions
+    for (uint32_t i = 0; i < numTransactions; i++)
+    {
+        uint64_t sourceAccountId = (i % accounts) + offset;
+
+        // Create a payment transaction
+        auto [account, tx] = txgen.paymentTransaction(
+            accounts, offset, 0, sourceAccountId, 1, std::nullopt);
+
+        // Convert to TransactionEnvelope and write to output
+        TransactionEnvelope txEnv = tx->getEnvelope();
+        out.writeOne(txEnv);
+    }
+
+    out.close();
+    LOG_INFO(DEFAULT_LOG, "Generated {} transactions in {}", numTransactions,
+             outputFile);
 }
 }

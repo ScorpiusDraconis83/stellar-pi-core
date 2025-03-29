@@ -32,6 +32,10 @@ class SorobanMetrics
     uint64_t mCounterLedgerWriteEntry{0};
     uint64_t mCounterLedgerWriteByte{0};
 
+    uint64_t mLedgerInsnsCount{0};
+    uint64_t mLedgerInsnsExclVmCount{0};
+    uint64_t mLedgerHostFnExecTimeNsecs{0};
+
   public:
     // ledger-wide metrics
     medida::Histogram& mLedgerTxCount;
@@ -41,6 +45,8 @@ class SorobanMetrics
     medida::Histogram& mLedgerReadLedgerByte;
     medida::Histogram& mLedgerWriteEntry;
     medida::Histogram& mLedgerWriteLedgerByte;
+    medida::Histogram& mLedgerHostFnCpuInsnsRatio;
+    medida::Histogram& mLedgerHostFnCpuInsnsRatioExclVm;
 
     // tx-wide metrics
     medida::Histogram& mTxSizeByte;
@@ -65,6 +71,7 @@ class SorobanMetrics
     medida::Timer& mHostFnOpInvokeTimeNsecsExclVm;
     medida::Histogram& mHostFnOpInvokeTimeFsecsCpuInsnRatio;
     medida::Histogram& mHostFnOpInvokeTimeFsecsCpuInsnRatioExclVm;
+    medida::Histogram& mHostFnOpDeclaredInsnsUsageRatio;
     medida::Meter& mHostFnOpMaxRwKeyByte;
     medida::Meter& mHostFnOpMaxRwDataByte;
     medida::Meter& mHostFnOpMaxRwCodeByte;
@@ -106,6 +113,9 @@ class SorobanMetrics
 
     SorobanMetrics(medida::MetricsRegistry& metrics);
 
+    void accumulateModelledCpuInsns(uint64_t insnsCount,
+                                    uint64_t insnsExclVmCount,
+                                    uint64_t execTimeNsecs);
     void accumulateLedgerTxCount(uint64_t txCount);
     void accumulateLedgerCpuInsn(uint64_t cpuInsn);
     void accumulateLedgerTxsSizeByte(uint64_t txsSizeByte);

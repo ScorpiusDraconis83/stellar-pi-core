@@ -26,26 +26,43 @@ Metric name                               | Type      | Description
 ---------------------------------------   | --------  | --------------------
 app.post-on-background-thread.delay       | timer     | time to start task posted to background thread
 app.post-on-main-thread.delay             | timer     | time to start task posted to current crank of main thread
-bucket.batch.addtime                      | timer     | time to add a batch
-bucket.batch.objectsadded                 | meter     | number of objects added per batch
+app.post-on-overlay-thread.delay          | timer     | time to start task posted to overlay thread
+app.post-on-ledger-close-thread.delay     | timer     | time to start task posted to ledger close thread
+bucket.batch.addtime                      | timer     | time to add a live batch
+bucket.batch.objectsadded                 | meter     | number of objects added per live batch
+bucket.batch-archive.addtime              | timer     | time to add a hot archive batch
+bucket.batch-archive.objectsadded         | meter     | number of objects added per hot archive batch
 bucket.memory.shared                      | counter   | number of buckets referenced (excluding publish queue)
 bucket.merge-time.level-<X>               | timer     | time to merge two buckets on level <X>
 bucket.snap.merge                         | timer     | time to merge two buckets
+bucketlist-archive.size.bytes             | counter   | total size of the hot archive BucketList in bytes
 bucketlist.size.bytes                     | counter   | total size of the BucketList in bytes
-bucketlistDB.bloom.lookups                | meter     | number of bloom filter lookups
-bucketlistDB.bloom.misses                 | meter     | number of bloom filter false positives
-bucketlistDB.bulk.loads                   | meter     | number of entries BucketListDB queried to prefetch
-bucketlistDB.bulk.inflationWinners        | timer     | time to load inflation winners
-bucketlistDB.bulk.poolshareTrustlines     | timer     | time to load poolshare trustlines by accountID and assetID
-bucketlistDB.bulk.prefetch                | timer     | time to prefetch
-bucketlistDB.point.<X>                    | timer     | time to load single entry of type <X> (if no bloom miss occurred)
+bucketlist.entryCounts.-<X>               | counter   | number of entries of type <X> in the BucketList
+bucketlist.entrySizes.-<X>                | counter   | size of entries of type <X> in the BucketList
+bucketlistDB-<X>.bloom.lookups              | meter     | number of bloom filter lookups on BucketList <X> (live/hotArchive)
+bucketlistDB-<X>.bloom.misses               | meter     | number of bloom filter false positives on BucketList <X> (live/hotArchive)
+bucketlistDB-<X>.bulk.loads                 | meter     | number of entries BucketListDB queried to prefetch on BucketList <X> (live/hot-archive)
+bucketlistDB-live.bulk.inflationWinners     | timer     | time to load inflation winners
+bucketlistDB-live.bulk.poolshareTrustlines  | timer     | time to load poolshare trustlines by accountID and assetID
+bucketlistDB-live.bulk.prefetch             | timer     | time to prefetch
+bucketlistDB-live.bulk.eviction           | timer     | time to load for eviction scan
+bucketlistDB-live.bulk.query              | timer     | time to load for query server
+bucketlistDB-<X>.<Y>.sum                  | counter   | sum of time (microseconds) to load single entry of type <Y> on BucketList <X> (live/hotArchive)
+bucketlistDB-<X>.<Y>.count                | counter   | number of times single entry of type <Y> on BucketList <X> (live/hotArchive) is loaded
+bucketlistDB-cache.hit                    | meter     | number of cache hits on Live BucketList Disk random eviction cache
+bucketlistDB-cache.miss                   | meter     | number of cache misses on Live BucketList Disk random eviction cache
+crypto.verify.hit                         | meter     | number of signature cache hits
+crypto.verify.miss                        | meter     | number of signature cache misses
+crypto.verify.total                       | meter     | sum of both hits and misses
 herder.pending[-soroban]-txs.age0         | counter   | number of gen0 pending transactions
 herder.pending[-soroban]-txs.age1         | counter   | number of gen1 pending transactions
 herder.pending[-soroban]-txs.age2         | counter   | number of gen2 pending transactions
 herder.pending[-soroban]-txs.age3         | counter   | number of gen3 pending transactions
 herder.pending[-soroban]-txs.banned       | counter   | number of transactions that got banned
-herder.pending[-soroban]-txs.delay        | timer     | time for transactions to be included in a ledger
-herder.pending[-soroban]-txs.self-delay   | timer     | time for transactions submitted from this node to be included in a ledger
+herder.pending[-soroban]-txs.sum          | counter   | sum of time (milliseconds) for transactions to be included in a ledger
+herder.pending[-soroban]-txs.count        | counter   | number of transactions to be included in a ledger
+herder.pending[-soroban]-txs.self-sum     | counter   | sum of time (milliseconds) for transactions submitted from this node to be included in a ledger
+herder.pending[-soroban]-txs.self-count   | counter   | number of transactions submitted from this node to be included in a ledger
 history.check.failure                     | meter     | history archive status checks failed
 history.check.success                     | meter     | history archive status checks succeeded
 history.publish.failure                   | meter     | published failed
@@ -74,6 +91,7 @@ loadgen.account.created                   | meter     | loadgenerator: account c
 loadgen.payment.native                    | meter     | loadgenerator: native payment submitted
 loadgen.pretend.submitted                 | meter     | loadgenerator: pretend ops submitted
 loadgen.run.complete                      | meter     | loadgenerator: run complete
+loadgen.run.start                         | meter     | loadgenerator: run started
 loadgen.soroban.create_upgrade            | meter     | loadgenerator: soroban create upgrade TXs submitted
 loadgen.soroban.invoke                    | meter     | loadgenerator: soroban invoke TXs submitted
 loadgen.soroban.setup_invoke              | meter     | loadgenerator: soroban setup invoke TXs submitted
@@ -99,6 +117,8 @@ overlay.error.read                        | meter     | error while receiving a 
 overlay.error.write                       | meter     | error while sending a message
 overlay.fetch.txset                       | timer     | time to complete fetching of a txset
 overlay.fetch.qset                        | timer     | time to complete fetching of a qset
+overlay.fetch.unique-recv                 | meter     | number of bytes of fetched messages that have not yet been received
+overlay.fetch.duplicate-recv              | meter     | number of bytes of fetched messages that have already been received
 overlay.flood.advertised                  | meter     | transactions advertised through pull mode
 overlay.flood.demanded                    | meter     | transactions demanded through pull mode
 overlay.flood.fulfilled                   | meter     | demanded transactions fulfilled through pull mode
@@ -109,7 +129,6 @@ overlay.flood.peer-tx-pull-latency        | timer     | time to pull a transacti
 overlay.demand.timeout                    | meter     | pull mode timeouts
 overlay.flood.relevant-txs                | meter     | relevant transactions pulled from peers
 overlay.flood.irrelevant-txs              | meter     | irrelevant transactions pulled from peers
-overlay.flood.advert-delay                | timer     | time each advert sits in the inbound queue
 overlay.flood.abandoned-demands           | meter     | tx hash pull demands that no peers responded
 overlay.flood.broadcast                   | meter     | message sent as broadcast per peer
 overlay.flood.duplicate_recv              | meter     | number of bytes of flooded messages that have already been received
@@ -118,6 +137,7 @@ overlay.inbound.attempt                   | meter     | inbound connection attem
 overlay.inbound.drop                      | meter     | inbound connection dropped
 overlay.inbound.establish                 | meter     | inbound connection established (added to pending)
 overlay.inbound.reject                    | meter     | inbound connection rejected
+overlay.inbound.live                      | counter   | number of live inbound connections
 overlay.outbound-queue.<X>                | timer     | time <X> traffic sits in flow-controlled queues
 overlay.outbound-queue.drop-<X>           | meter     | number of <X> messages dropped from flow-controlled queues
 overlay.item-fetcher.next-peer            | meter     | ask for item past the first one
@@ -130,9 +150,12 @@ overlay.outbound.attempt                  | meter     | outbound connection atte
 overlay.outbound.cancel                   | meter     | outbound connection cancelled
 overlay.outbound.drop                     | meter     | outbound connection dropped
 overlay.outbound.establish                | meter     | outbound connection established (added to pending)
-overlay.recv.<X>                          | timer     | received message <X>
+overlay.recv.<X>                          | timer     | received message <X> (except transaction)
+overlay.recv-transaction.sum              | counter   | sum of time (microseconds) to receive transaction message
+overlay.recv-transaction.count            | counter   | number of transaction messages received
 overlay.send.<X>                          | meter     | sent message <X>
 overlay.timeout.idle                      | meter     | idle peer timeout
+overlay.timeout.straggler                 | meter     | straggler peer timeout
 overlay.recv.start-survey-collecting      | timer     | time spent in processing request to start survey collecting phase
 overlay.recv.stop-survey-collecting       | timer     | time spent in processing request to stop survey collecting phase
 overlay.recv.survey-request               | timer     | time spent in processing survey request
@@ -143,6 +166,8 @@ overlay.send.survey-request               | meter     | sent survey request
 overlay.send.survey-response              | meter     | sent survey response
 process.action.queue                      | counter   | number of items waiting in internal action-queue
 process.action.overloaded                 | counter   | 0-or-1 value indicating action-queue overloading
+process.file.handles                      | counter   | number of open file handles
+process.memory.handles                    | counter   | number of running processes in process manager
 scp.envelope.emit                         | meter     | SCP message sent
 scp.envelope.invalidsig                   | meter     | envelope failed signature verification
 scp.envelope.receive                      | meter     | SCP message received
@@ -189,6 +214,9 @@ soroban.host-fn-op.cpu-insn-excl-vm          | meter     | number of metered cpu
 soroban.host-fn-op.invoke-time-nsecs-excl-vm | timer     | time spent in soroban host invocation excluding VM instantiation
 soroban.host-fn-op.invoke-time-fsecs-cpu-insn-ratio         | histogram | ratio between soroban host invocation time (femto-seconds) and metered cpu instructions
 soroban.host-fn-op.invoke-time-fsecs-cpu-insn-ratio-excl-vm | histogram | ratio between soroban host invocation time (femto-seconds) and metered cpu instructions, excluding VM instantiation
+soroban.host-fn-op.ledger-cpu-insns-ratio    | histogram | ratio between ledger time (milliseconds) and metered CPU instructions
+soroban.host-fn-op.ledger-cpu-insns-ratio-excl-vm | histogram | ratio between ledger time (milliseconds) and metered CPU instructions, excluding VM instantiation
+soroban.host-fn-op.declared-cpu-insns-usage-ratio | histogram | ratio between declared CPU instructions and actual usage
 soroban.host-fn-op.max-rw-key-byte           | meter     | size of the largest `LedgerKey` (in bytes) among all entires accessed (read or modified) during the `InvokeHostFunctionOp`
 soroban.host-fn-op.max-rw-data-byte          | meter     | size of the largest `ContractDataEntry` (in bytes) among all entires accessed (read or modified) during the `InvokeHostFunctionOp`
 soroban.host-fn-op.max-rw-code-byte          | meter     | size of the largest `ContractCodeEntry` (in bytes) among all entires accessed (read or modified) during the `InvokeHostFunctionOp`
@@ -220,6 +248,7 @@ soroban.config.tx-max-read-ledger-byte       | counter   | soroban config settin
 soroban.config.tx-max-write-entry            | counter   | soroban config setting `tx_max_write_ledger_entries`
 soroban.config.tx-max-write-ledger-byte      | counter   | soroban config setting `tx_max_write_bytes`
 soroban.config.tx-max-emit-event-byte        | counter   | soroban config setting `tx_max_contract_events_size_bytes`
+soroban.config.fee-write-1kb                 | counter   | soroban config setting fee per 1KB of ledger data written
 soroban.config.ledger-max-tx-count           | counter   | soroban config setting `ledger_max_tx_count`
 soroban.config.ledger-max-cpu-insn           | counter   | soroban config setting `ledger_max_instructions`
 soroban.config.ledger-max-txs-size-byte      | counter   | soroban config setting `ledger_max_txs_size_bytes`

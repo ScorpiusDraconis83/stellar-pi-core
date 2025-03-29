@@ -176,7 +176,6 @@ mod rust_bridge {
     // The extern "Rust" block declares rust stuff we're going to export to C++.
     #[namespace = "stellar::rust_bridge"]
     extern "Rust" {
-        fn start_tracy();
         fn to_base64(b: &CxxVector<u8>, mut s: Pin<&mut CxxString>);
         fn from_base64(s: &CxxString, mut b: Pin<&mut CxxVector<u8>>);
         fn check_sensible_soroban_config_for_protocol(core_max_proto: u32);
@@ -185,7 +184,7 @@ mod rust_bridge {
             enable_diagnostics: bool,
             instruction_limit: u32,
             hf_buf: &CxxBuf,
-            resources: &CxxBuf,
+            resources: CxxBuf,
             source_account: &CxxBuf,
             auth_entries: &Vec<CxxBuf>,
             ledger_info: CxxLedgerInfo,
@@ -298,11 +297,26 @@ impl AsRef<[u8]> for CxxBuf {
     }
 }
 
+impl CxxBuf {
+    #[cfg(feature = "testutils")]
+    fn replace_data_with(&mut self, slice: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        if self.data.is_null() {
+            return Err("CxxBuf::replace_data_with: data is null".into());
+        }
+        while self.data.len() > 0 {
+            self.data.pin_mut().pop();
+        }
+        for byte in slice {
+            self.data.pin_mut().push(*byte);
+        }
+        Ok(())
+    }
+}
+
 // Then we import various implementations to this module, for export through the bridge.
 mod b64;
 
 use core::panic;
-use std::str::FromStr;
 
 use b64::{from_base64, to_base64};
 
@@ -490,148 +504,80 @@ use rust_bridge::RustBuf;
 use rust_bridge::SorobanVersionInfo;
 
 mod log;
-
-use crate::log::init_logging;
+#[cfg(feature = "testutils")]
+use ::log::{info, warn};
+use log::init_logging;
+#[cfg(feature = "testutils")]
+use log::partition::TX;
 
 // We have multiple copies of soroban linked into stellar-core here. This is
 // accomplished using an adaptor module -- contract.rs -- mounted multiple times
-// into the same outer crate, inside different modules soroban_p21, soroban_p22,
-// etc. each with its own local binding for the external crate soroban_env_host.
-// The contract.rs module imports soroban_env_host from `super` which means each
+// into the same outer crate, inside different modules p21, p22, etc. each with
+// its own local binding for the external crate soroban_env_host. The
+// contract.rs module imports soroban_env_host from `super` which means each
 // instance of it sees a different soroban. This is a bit of a hack and only
 // works when the soroban versions all have a compatible _enough_ interface to
 // all be called from "the same" contract.rs.
-
 #[path = "."]
-mod soroban_p22 {
-    pub(crate) use soroban_env_host_p22 as soroban_env_host;
+mod p23 {
+    pub(crate) extern crate soroban_env_host_p23;
+    pub(crate) use soroban_env_host_p23 as soroban_env_host;
 
     pub(crate) mod contract;
+
+    // An adapter for some API breakage between p21 and p22.
+    pub(crate) const fn get_version_pre_release(v: &soroban_env_host::Version) -> u32 {
+        v.interface.pre_release
+    }
+
+    pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
+        // Temporarily hardcode the protocol version until we actually bump it
+        // in the host library.
+        23
+    }
 }
 
 #[path = "."]
-mod soroban_p21 {
+mod p22 {
+    pub(crate) extern crate soroban_env_host_p22;
+    pub(crate) use soroban_env_host_p22 as soroban_env_host;
+
+    pub(crate) mod contract;
+
+    // An adapter for some API breakage between p21 and p22.
+    pub(crate) const fn get_version_pre_release(v: &soroban_env_host::Version) -> u32 {
+        v.interface.pre_release
+    }
+
+    pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
+        v.interface.protocol
+    }
+}
+
+#[path = "."]
+mod p21 {
+    pub(crate) extern crate soroban_env_host_p21;
     pub(crate) use soroban_env_host_p21 as soroban_env_host;
 
     pub(crate) mod contract;
+
+    // An adapter for some API breakage between p21 and p22.
+    pub(crate) const fn get_version_pre_release(v: &soroban_env_host::Version) -> u32 {
+        soroban_env_host::meta::get_pre_release_version(v.interface)
+    }
+
+    pub(crate) const fn get_version_protocol(v: &soroban_env_host::Version) -> u32 {
+        soroban_env_host::meta::get_ledger_protocol_version(v.interface)
+    }
 }
 
 // We alias the latest soroban as soroban_curr to help reduce churn in code
 // that's just always supposed to use the latest.
-use soroban_p22 as soroban_curr;
-
-use cargo_lock::{dependency::graph::EdgeDirection, Lockfile};
-
-fn package_matches_hash(pkg: &cargo_lock::Package, hash: &str) -> bool {
-    // Try comparing hash to hashes in either the package checksum or the source
-    // precise field
-    if let Some(cksum) = &pkg.checksum {
-        if cksum.to_string() == hash {
-            return true;
-        }
-    }
-    if let Some(src) = &pkg.source {
-        if let Some(precise) = src.precise() {
-            if precise == hash {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-impl HostModule {
-    fn check_lockfile_has_expected_dep_tree(&self, core_max_proto: u32, lockfile: &Lockfile) {
-        let ver_info = (self.get_soroban_version_info)(core_max_proto);
-        let pkg = lockfile
-            .packages
-            .iter()
-            .find(|p| {
-                p.name.as_str() == "soroban-env-host"
-                    && package_matches_hash(p, &ver_info.env_git_rev)
-            })
-            .expect("locating host package in Cargo.lock");
-
-        if !cfg!(feature = "core-vnext") {
-            if ver_info.env_pre_release_ver != 0 && pkg.version.pre.is_empty() {
-                panic!("soroban interface version indicates pre-release {} but package version is {}, with empty prerelease component",
-                    ver_info.env_pre_release_ver, pkg.version)
-            }
-
-            if pkg.version.major == 0 || !pkg.version.pre.is_empty() {
-                eprintln!(
-                    "Warning: soroban-env-host-{} is running a pre-release version {}",
-                    ver_info.env_max_proto, pkg.version
-                );
-            } else if pkg.version.major != ver_info.env_max_proto as u64 {
-                panic!(
-                "soroban-env-host-{} version {} major version {} does not match expected protocol version {}",
-                ver_info.env_max_proto, pkg.version, pkg.version.major, ver_info.env_max_proto
-            )
-            }
-        }
-
-        let tree = lockfile
-            .dependency_tree()
-            .expect("calculating global dep tree of Cargo.lock");
-
-        let node = tree.nodes()[&pkg.into()];
-
-        let mut tree_buf = Vec::new();
-        tree.render(&mut tree_buf, node, EdgeDirection::Outgoing, true)
-            .expect("rendering dep tree");
-
-        let tree_str = String::from_utf8_lossy(&tree_buf);
-        // Normalize line endings to support Windows builds.
-        if tree_str.replace("\r\n", "\n") != self.dep_tree.replace("\r\n", "\n") {
-            eprintln!(
-                "Expected 'soroban-env-host@{}' host dependency tree (in dep-trees/{}.txt):",
-                ver_info.env_git_rev, self.name
-            );
-            eprintln!("---\n{}---", self.dep_tree);
-            eprintln!(
-                "Found 'soroban-env-host@{}' host dependency tree (in Cargo.lock):",
-                ver_info.env_git_rev
-            );
-            eprintln!("---\n{}---", tree_str);
-            panic!(
-                "Unexpected '{}' / 'soroban-env-host@{}' host dependency tree",
-                self.name, ver_info.env_git_rev
-            );
-        }
-    }
-}
-
-// This function performs a crude dynamic check that the contents of Cargo.lock
-// against-which the current binary was compiled specified _exactly_ the same
-// host dep trees that are stored (redundantly, graphically) in the files
-// dep-trees/soroban_p{NN}.txt.
-//
-// The contents of all these files are compiled-in to the binary as static
-// strings. Any discrepancy between the logical content of Cargo.lock and the
-// derived dep tree(s) will cause the program to abort on startup.
-//
-// The point of this check is twofold: to catch cases where the developer
-// accidentally bumps dependencies (which cargo does fairly easily), and also to
-// make crystal clear when doing a commit that intentionally bumps dependencies
-// which of the _dependency tree(s)_ is being affected, and how.
-//
-// The check additionally checks that the major version number of soroban that
-// is compiled-in matches its max supported protocol number.
-fn check_lockfile_has_expected_dep_trees(core_max_proto: u32) {
-    static CARGO_LOCK_FILE_CONTENT: &'static str = include_str!("../../../Cargo.lock");
-    let lockfile = Lockfile::from_str(CARGO_LOCK_FILE_CONTENT)
-        .expect("parsing compiled-in Cargo.lock file content");
-
-    for hm in HOST_MODULES.iter() {
-        hm.check_lockfile_has_expected_dep_tree(core_max_proto, &lockfile);
-    }
-}
+use p22 as soroban_curr;
 
 // This is called on startup and does any initial internal dynamic checks.
 pub fn check_sensible_soroban_config_for_protocol(core_max_proto: u32) {
     use itertools::Itertools;
-    check_lockfile_has_expected_dep_trees(core_max_proto);
     for (lo, hi) in HOST_MODULES.iter().tuple_windows() {
         assert!(
             lo.max_proto < hi.max_proto,
@@ -691,8 +637,6 @@ struct HostModule {
     // dispatch. The struct returned from `get_version_info` contains a bunch of
     // dynamic strings, which is necessary due to cxx limitations.
     max_proto: u32,
-    name: &'static str,
-    dep_tree: &'static str,
     get_soroban_version_info: fn(u32) -> SorobanVersionInfo,
     invoke_host_function: fn(
         enable_diagnostics: bool,
@@ -701,11 +645,11 @@ struct HostModule {
         resources_buf: &CxxBuf,
         source_account_buf: &CxxBuf,
         auth_entries: &Vec<CxxBuf>,
-        ledger_info: CxxLedgerInfo,
+        ledger_info: &CxxLedgerInfo,
         ledger_entries: &Vec<CxxBuf>,
         ttl_entries: &Vec<CxxBuf>,
         base_prng_seed: &CxxBuf,
-        rent_fee_configuration: CxxRentFeeConfiguration,
+        rent_fee_configuration: &CxxRentFeeConfiguration,
     ) -> Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>>,
     compute_transaction_resource_fee:
         fn(tx_resources: CxxTransactionResources, fee_config: CxxFeeConfiguration) -> FeePair,
@@ -717,20 +661,28 @@ struct HostModule {
     compute_write_fee_per_1kb:
         fn(bucket_list_size: i64, fee_config: CxxWriteFeeConfiguration) -> i64,
     can_parse_transaction: fn(&CxxBuf, depth_limit: u32) -> bool,
+    #[cfg(feature = "testutils")]
+    rustbuf_containing_scval_to_string: fn(&RustBuf) -> String,
+    #[cfg(feature = "testutils")]
+    rustbuf_containing_diagnostic_event_to_string: fn(&RustBuf) -> String,
 }
 
 macro_rules! proto_versioned_functions_for_module {
     ($module:ident) => {
         HostModule {
             max_proto: $module::contract::get_max_proto(),
-            dep_tree: include_str!(concat!("dep-trees/", stringify!($module), ".txt")),
-            name: stringify!($module),
             get_soroban_version_info: $module::contract::get_soroban_version_info,
             invoke_host_function: $module::contract::invoke_host_function,
             compute_transaction_resource_fee: $module::contract::compute_transaction_resource_fee,
             compute_rent_fee: $module::contract::compute_rent_fee,
             compute_write_fee_per_1kb: $module::contract::compute_write_fee_per_1kb,
             can_parse_transaction: $module::contract::can_parse_transaction,
+            #[cfg(feature = "testutils")]
+            rustbuf_containing_scval_to_string:
+                $module::contract::rustbuf_containing_scval_to_string,
+            #[cfg(feature = "testutils")]
+            rustbuf_containing_diagnostic_event_to_string:
+                $module::contract::rustbuf_containing_diagnostic_event_to_string,
         }
     };
 }
@@ -738,8 +690,9 @@ macro_rules! proto_versioned_functions_for_module {
 // NB: this list should be in ascending order. Out of order will cause
 // an assert to fail in the by-protocol-number lookup function below.
 const HOST_MODULES: &'static [HostModule] = &[
-    proto_versioned_functions_for_module!(soroban_p21),
-    proto_versioned_functions_for_module!(soroban_p22),
+    proto_versioned_functions_for_module!(p21),
+    proto_versioned_functions_for_module!(p22),
+    proto_versioned_functions_for_module!(p23),
 ];
 
 fn get_host_module_for_protocol(
@@ -771,6 +724,7 @@ fn protocol_dispatches_as_expected() {
     assert_eq!(get_host_module_for_protocol(20, 20).unwrap().max_proto, 21);
     assert_eq!(get_host_module_for_protocol(21, 21).unwrap().max_proto, 21);
     assert_eq!(get_host_module_for_protocol(22, 22).unwrap().max_proto, 22);
+    assert_eq!(get_host_module_for_protocol(23, 23).unwrap().max_proto, 23);
 
     // No protocols past the max known.
     let last_proto = HOST_MODULES.last().unwrap().max_proto;
@@ -785,7 +739,7 @@ pub(crate) fn invoke_host_function(
     enable_diagnostics: bool,
     instruction_limit: u32,
     hf_buf: &CxxBuf,
-    resources_buf: &CxxBuf,
+    resources_buf: CxxBuf,
     source_account_buf: &CxxBuf,
     auth_entries: &Vec<CxxBuf>,
     ledger_info: CxxLedgerInfo,
@@ -795,7 +749,25 @@ pub(crate) fn invoke_host_function(
     rent_fee_configuration: CxxRentFeeConfiguration,
 ) -> Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>> {
     let hm = get_host_module_for_protocol(config_max_protocol, ledger_info.protocol_version)?;
-    (hm.invoke_host_function)(
+    let res = (hm.invoke_host_function)(
+        enable_diagnostics,
+        instruction_limit,
+        hf_buf,
+        &resources_buf,
+        source_account_buf,
+        auth_entries,
+        &ledger_info,
+        ledger_entries,
+        ttl_entries,
+        base_prng_seed,
+        &rent_fee_configuration,
+    );
+
+    #[cfg(feature = "testutils")]
+    test_extra_protocol::maybe_invoke_host_function_again_and_compare_outputs(
+        &res,
+        &hm,
+        config_max_protocol,
         enable_diagnostics,
         instruction_limit,
         hf_buf,
@@ -807,7 +779,203 @@ pub(crate) fn invoke_host_function(
         ttl_entries,
         base_prng_seed,
         rent_fee_configuration,
-    )
+    );
+
+    res
+}
+
+// This module contains helper code to assist in comparing two versions of
+// soroban against one another by running the same transaction twice on
+// different hosts, and comparing its output for divergence or changes to costs.
+// All this functionality is gated by the "testutils" feature.
+#[cfg(feature = "testutils")]
+mod test_extra_protocol {
+
+    use super::*;
+    use std::hash::Hasher;
+    use std::str::FromStr;
+
+    pub(super) fn maybe_invoke_host_function_again_and_compare_outputs(
+        res1: &Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>>,
+        hm1: &HostModule,
+        _config_max_protocol: u32,
+        _enable_diagnostics: bool,
+        mut instruction_limit: u32,
+        hf_buf: &CxxBuf,
+        mut resources_buf: CxxBuf,
+        source_account_buf: &CxxBuf,
+        auth_entries: &Vec<CxxBuf>,
+        mut ledger_info: CxxLedgerInfo,
+        ledger_entries: &Vec<CxxBuf>,
+        ttl_entries: &Vec<CxxBuf>,
+        base_prng_seed: &CxxBuf,
+        rent_fee_configuration: CxxRentFeeConfiguration,
+    ) {
+        if let Ok(extra) = std::env::var("SOROBAN_TEST_EXTRA_PROTOCOL") {
+            if let Ok(proto) = u32::from_str(&extra) {
+                info!(target: TX, "comparing soroban host for protocol {} with {}", ledger_info.protocol_version, proto);
+                if let Ok(hm2) = get_host_module_for_protocol(proto, proto) {
+                    if let Err(e) =
+                        modify_ledger_info_for_extra_test_execution(&mut ledger_info, proto)
+                    {
+                        warn!(target: TX, "modifying ledger info for protocol {} re-execution failed: {:?}", proto, e);
+                        return;
+                    }
+                    if let Err(e) = modify_resources_for_extra_test_execution(
+                        &mut instruction_limit,
+                        &mut resources_buf,
+                        proto,
+                    ) {
+                        warn!(target: TX, "modifying resources for protocol {} re-execution failed: {:?}", proto, e);
+                        return;
+                    }
+                    let res2 = (hm2.invoke_host_function)(
+                        /*enable_diagnostics=*/ true,
+                        instruction_limit,
+                        hf_buf,
+                        &resources_buf,
+                        source_account_buf,
+                        auth_entries,
+                        &ledger_info,
+                        ledger_entries,
+                        ttl_entries,
+                        base_prng_seed,
+                        &rent_fee_configuration,
+                    );
+                    if mostly_the_same_host_function_output(&res1, &res2) {
+                        info!(target: TX, "{}", summarize_host_function_output(hm1, &res1));
+                        info!(target: TX, "{}", summarize_host_function_output(hm2, &res2));
+                    } else {
+                        warn!(target: TX, "{}", summarize_host_function_output(hm1, &res1));
+                        warn!(target: TX, "{}", summarize_host_function_output(hm2, &res2));
+                    }
+                } else {
+                    warn!(target: TX, "SOROBAN_TEST_EXTRA_PROTOCOL={} not supported", proto);
+                }
+            } else {
+                warn!(target: TX, "invalid protocol number in SOROBAN_TEST_EXTRA_PROTOCOL");
+            }
+        }
+    }
+
+    fn modify_resources_for_extra_test_execution(
+        instruction_limit: &mut u32,
+        resources_buf: &mut CxxBuf,
+        new_protocol: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match new_protocol {
+            22 => {
+                use p22::contract::{inplace_modify_cxxbuf_encoded_type, xdr::SorobanResources};
+                if let Ok(extra) = std::env::var("SOROBAN_TEST_CPU_BUDGET_FACTOR") {
+                    if let Ok(factor) = u32::from_str(&extra) {
+                        inplace_modify_cxxbuf_encoded_type::<SorobanResources>(
+                            resources_buf,
+                            |resources: &mut SorobanResources| {
+                                info!(target: TX, "multiplying CPU budget for re-execution by {}: {} -> {} (and {} -> {} in limit)",
+                                        factor, resources.instructions, resources.instructions * factor, *instruction_limit, *instruction_limit * factor);
+                                resources.instructions *= factor;
+                                *instruction_limit *= factor;
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        warn!(target: TX, "SOROBAN_TEST_CPU_BUDGET_FACTOR={} not valid", extra);
+                    }
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    fn modify_ledger_info_for_extra_test_execution(
+        ledger_info: &mut CxxLedgerInfo,
+        new_protocol: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Here we need to simulate any upgrade that would be done in the ledger
+        // info to migrate from the old protocol to the new one. This is somewhat
+        // protocol-specific so we just write it by hand.
+
+        // At very least, we always need to upgrade the protocol version in the
+        // ledger info.
+        ledger_info.protocol_version = new_protocol;
+
+        match new_protocol {
+            // At present no adjustments need to be made, only new costs exist
+            // in p22, not changes to existing ones.
+            //
+            // FIXME: any changes to cost types should be centralized and pulled
+            // from the same location, having multiple copies like this is bad,
+            // we already have a bug open on the problem occurring between
+            // budget defaults in soroban and upgrades.
+            //
+            // See: https://github.com/stellar/stellar-core/issues/4496
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn hash_rustbuf(buf: &RustBuf) -> u16 {
+        use std::hash::Hash;
+        let mut hasher = std::hash::DefaultHasher::new();
+        buf.data.hash(&mut hasher);
+        hasher.finish() as u16
+    }
+    fn hash_rustbufs(bufs: &Vec<RustBuf>) -> u16 {
+        use std::hash::Hash;
+        let mut hasher = std::hash::DefaultHasher::new();
+        for buf in bufs.iter() {
+            buf.data.hash(&mut hasher);
+        }
+        hasher.finish() as u16
+    }
+    fn mostly_the_same_host_function_output(
+        res: &Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>>,
+        res2: &Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>>,
+    ) -> bool {
+        match (res, res2) {
+            (Ok(res), Ok(res2)) => {
+                res.success == res2.success
+                    && hash_rustbuf(&res.result_value) == hash_rustbuf(&res2.result_value)
+                    && hash_rustbufs(&res.contract_events) == hash_rustbufs(&res2.contract_events)
+                    && hash_rustbufs(&res.modified_ledger_entries)
+                        == hash_rustbufs(&res2.modified_ledger_entries)
+                    && res.rent_fee == res2.rent_fee
+            }
+            (Err(e), Err(e2)) => format!("{:?}", e) == format!("{:?}", e2),
+            _ => false,
+        }
+    }
+    fn summarize_host_function_output(
+        hm: &HostModule,
+        res: &Result<InvokeHostFunctionOutput, Box<dyn std::error::Error>>,
+    ) -> String {
+        match res {
+            Ok(res) if res.success => format!(
+                "proto={}, ok/succ, res={:x}/{}, events={:x}, entries={:x}, rent={}, cpu={}, mem={}, nsec={}",
+                hm.max_proto,
+                hash_rustbuf(&res.result_value),
+                (hm.rustbuf_containing_scval_to_string)(&res.result_value),
+                hash_rustbufs(&res.contract_events),
+                hash_rustbufs(&res.modified_ledger_entries),
+                res.rent_fee,
+                res.cpu_insns,
+                res.mem_bytes,
+                res.time_nsecs
+            ),
+            Ok(res) => format!(
+                "proto={}, ok/fail, cpu={}, mem={}, nsec={}, diag={:?}",
+                hm.max_proto,
+                res.cpu_insns,
+                res.mem_bytes,
+                res.time_nsecs,
+                res.diagnostic_events.iter().map(|d|
+                    (hm.rustbuf_containing_diagnostic_event_to_string)(d)).collect::<Vec<String>>()
+            ),
+            Err(e) => format!("proto={}, error={:?}", hm.max_proto, e),
+        }
+    }
 }
 
 pub(crate) fn compute_transaction_resource_fee(
@@ -856,11 +1024,4 @@ pub(crate) fn compute_write_fee_per_1kb(
 ) -> Result<i64, Box<dyn std::error::Error>> {
     let hm = get_host_module_for_protocol(config_max_protocol, protocol_version)?;
     Ok((hm.compute_write_fee_per_1kb)(bucket_list_size, fee_config))
-}
-
-fn start_tracy() {
-    #[cfg(feature = "tracy")]
-    tracy_client::Client::start();
-    #[cfg(not(feature = "tracy"))]
-    panic!("called start_tracy from non-cfg(feature=\"tracy\") build")
 }

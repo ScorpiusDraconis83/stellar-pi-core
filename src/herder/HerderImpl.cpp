@@ -3,6 +3,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "herder/HerderImpl.h"
+#include "bucket/BucketManager.h"
+#include "bucket/BucketSnapshotManager.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SHA.h"
@@ -14,9 +16,6 @@
 #include "herder/TxSetFrame.h"
 #include "herder/TxSetUtils.h"
 #include "ledger/LedgerManager.h"
-#include "ledger/LedgerTxn.h"
-#include "ledger/LedgerTxnEntry.h"
-#include "ledger/LedgerTxnHeader.h"
 #include "lib/json/json.h"
 #include "main/Application.h"
 #include "main/Config.h"
@@ -61,7 +60,6 @@ constexpr uint32 const CLOSE_TIME_DRIFT_SECONDS_THRESHOLD = 10;
 constexpr uint32 const TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4;
 constexpr uint32 const TRANSACTION_QUEUE_BAN_LEDGERS = 10;
 constexpr uint32 const TRANSACTION_QUEUE_SIZE_MULTIPLIER = 2;
-constexpr uint32 const SOROBAN_TRANSACTION_QUEUE_SIZE_MULTIPLIER = 2;
 
 std::unique_ptr<Herder>
 Herder::create(Application& app)
@@ -250,10 +248,6 @@ HerderImpl::newSlotExternalized(bool synchronous, StellarValue const& value)
     // start timing next externalize from this point
     mLastExternalize = mApp.getClock().now();
 
-    // In order to update the transaction queue we need to get the
-    // applied transactions.
-    updateTransactionQueue(mPendingEnvelopes.getTxSet(value.txSetHash));
-
     // perform cleanups
     // Evict slots that are outside of our ledger validity bracket
     auto minSlotToRemember = getMinLedgerSeqToRemember();
@@ -360,7 +354,7 @@ HerderImpl::processExternalized(uint64 slotIndex, StellarValue const& value,
         writeDebugTxSet(ledgerData);
     }
 
-    mLedgerManager.valueExternalized(ledgerData);
+    mLedgerManager.valueExternalized(ledgerData, isLatestSlot);
 }
 
 void
@@ -436,6 +430,15 @@ recordExternalizeAndCheckCloseTimeDrift(
 }
 
 void
+HerderImpl::beginApply()
+{
+    // Tx set might be applied async: in this case, cancel the timer. It'll be
+    // restarted when the tx set is applied. This is needed to not mess with
+    // Herder's out of sync recovery mechanism.
+    mTrackingTimer.cancel();
+}
+
+void
 HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value,
                               bool isLatestSlot)
 {
@@ -480,7 +483,12 @@ HerderImpl::valueExternalized(uint64 slotIndex, StellarValue const& value,
 
         // heart beat *after* doing all the work (ensures that we do not include
         // the overhead of externalization in the way we track SCP)
-        trackingHeartBeat();
+        // Note: this only makes sense in the context of synchronous ledger
+        // application on the main thread.
+        if (!mApp.getConfig().parallelLedgerClose())
+        {
+            trackingHeartBeat();
+        }
     }
     else
     {
@@ -582,7 +590,12 @@ HerderImpl::emitEnvelope(SCPEnvelope const& envelope)
 }
 
 TransactionQueue::AddResult
-HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
+HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf
+#ifdef BUILD_TESTS
+                            ,
+                            bool isLoadgenTx
+#endif
+)
 {
     ZoneScoped;
     TransactionQueue::AddResult result(
@@ -609,11 +622,21 @@ HerderImpl::recvTransaction(TransactionFrameBasePtr tx, bool submittedFromSelf)
     }
     else if (!tx->isSoroban())
     {
-        result = mTransactionQueue.tryAdd(tx, submittedFromSelf);
+        result = mTransactionQueue.tryAdd(tx, submittedFromSelf
+#ifdef BUILD_TESTS
+                                          ,
+                                          isLoadgenTx
+#endif
+        );
     }
     else if (mSorobanTransactionQueue)
     {
-        result = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf);
+        result = mSorobanTransactionQueue->tryAdd(tx, submittedFromSelf
+#ifdef BUILD_TESTS
+                                                  ,
+                                                  isLoadgenTx
+#endif
+        );
     }
     else
     {
@@ -1137,16 +1160,31 @@ HerderImpl::safelyProcessSCPQueue(bool synchronous)
 }
 
 void
-HerderImpl::lastClosedLedgerIncreased(bool latest)
+HerderImpl::lastClosedLedgerIncreased(bool latest, TxSetXDRFrameConstPtr txSet)
 {
+    releaseAssert(threadIsMain());
+
     maybeSetupSorobanQueue(
         mLedgerManager.getLastClosedLedgerHeader().header.ledgerVersion);
 
     // Ensure potential upgrades are handled in overlay
     maybeHandleUpgrade();
 
+    // In order to update the transaction queue we need to get the
+    // applied transactions.
+    updateTransactionQueue(txSet);
+
+    // If we're in sync and there are no buffered ledgers to apply, trigger next
+    // ledger
     if (latest)
     {
+        // Re-start heartbeat tracking _after_ applying the most up-to-date
+        // ledger. This guarantees out-of-sync timer won't fire while we have
+        // ledgers to apply (applicable during parallel ledger apply).
+        trackingHeartBeat();
+
+        // Ensure out of sync recovery did not get triggered while we were
+        // applying
         releaseAssert(isTracking());
         releaseAssert(trackingConsensusLedgerIndex() ==
                       mLedgerManager.getLastClosedLedgerNum());
@@ -1159,6 +1197,10 @@ HerderImpl::lastClosedLedgerIncreased(bool latest)
 void
 HerderImpl::setupTriggerNextLedger()
 {
+    // Invariant: core proceeds to vote for the next ledger only when it's _not_
+    // applying to ensure block production does not conflict with ledger close.
+    releaseAssert(!mLedgerManager.isApplying());
+
     // Invariant: tracking is equal to LCL when we trigger. This helps ensure
     // core emits SCP messages only for slots it can fully validate
     // (any closed ledger is fully validated)
@@ -1302,8 +1344,8 @@ uint32_t
 HerderImpl::getMostRecentCheckpointSeq()
 {
     auto lastIndex = trackingConsensusLedgerIndex();
-    return mApp.getHistoryManager().firstLedgerInCheckpointContaining(
-        lastIndex);
+    return HistoryManager::firstLedgerInCheckpointContaining(lastIndex,
+                                                             mApp.getConfig());
 }
 
 void
@@ -1348,10 +1390,22 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
         return;
     }
 
+    // If applying, the next ledger will trigger voting
+    if (mLedgerManager.isApplying())
+    {
+        // This can only happen when closing ledgers in parallel
+        releaseAssert(mApp.getConfig().parallelLedgerClose());
+        CLOG_DEBUG(Herder, "triggerNextLedger: skipping (applying) : {}",
+                   mApp.getStateHuman());
+        return;
+    }
+
     // our first choice for this round's set is all the tx we have collected
     // during last few ledger closes
+    // Since we are not currently applying, it is safe to use read-only LCL, as
+    // it's guaranteed to be up-to-date
     auto const& lcl = mLedgerManager.getLastClosedLedgerHeader();
-    TxSetPhaseTransactions txPhases;
+    PerPhaseTransactionList txPhases;
     txPhases.emplace_back(mTransactionQueue.getTransactions(lcl.header));
 
     if (protocolVersionStartsFrom(lcl.header.ledgerVersion,
@@ -1416,7 +1470,7 @@ HerderImpl::triggerNextLedger(uint32_t ledgerSeqToTrigger,
     upperBoundCloseTimeOffset = nextCloseTime - lcl.header.scpValue.closeTime;
     lowerBoundCloseTimeOffset = upperBoundCloseTimeOffset;
 
-    TxSetPhaseTransactions invalidTxPhases;
+    PerPhaseTransactionList invalidTxPhases;
     invalidTxPhases.resize(txPhases.size());
 
     auto [proposedSet, applicableProposedSet] =
@@ -1989,7 +2043,7 @@ HerderImpl::restoreSCPState()
 
     // Load all known tx sets
     auto latestTxSets = mApp.getPersistentState().getTxSetsForAllSlots();
-    for (auto const& txSet : latestTxSets)
+    for (auto const& [_, txSet] : latestTxSets)
     {
         try
         {
@@ -2018,7 +2072,7 @@ HerderImpl::restoreSCPState()
     // load saved state from database
     auto latest64 = mApp.getPersistentState().getSCPStateAllSlots();
 
-    for (auto const& state : latest64)
+    for (auto const& [_, state] : latest64)
     {
         try
         {
@@ -2058,16 +2112,19 @@ void
 HerderImpl::persistUpgrades()
 {
     ZoneScoped;
+    releaseAssert(threadIsMain());
     auto s = mUpgrades.getParameters().toJson();
-    mApp.getPersistentState().setState(PersistentState::kLedgerUpgrades, s);
+    mApp.getPersistentState().setState(PersistentState::kLedgerUpgrades, s,
+                                       mApp.getDatabase().getSession());
 }
 
 void
 HerderImpl::restoreUpgrades()
 {
     ZoneScoped;
-    std::string s =
-        mApp.getPersistentState().getState(PersistentState::kLedgerUpgrades);
+    releaseAssert(threadIsMain());
+    std::string s = mApp.getPersistentState().getState(
+        PersistentState::kLedgerUpgrades, mApp.getDatabase().getSession());
     if (!s.empty())
     {
         Upgrades::UpgradeParameters p;
@@ -2102,7 +2159,8 @@ HerderImpl::maybeHandleUpgrade()
             // no-op on any earlier protocol
             return;
         }
-        auto const& conf = mApp.getLedgerManager().getSorobanNetworkConfig();
+        auto const& conf =
+            mApp.getLedgerManager().getLastClosedSorobanNetworkConfig();
 
         auto maybeNewMaxTxSize =
             conf.txMaxSizeBytes() + getFlowControlExtraBuffer();
@@ -2148,15 +2206,13 @@ HerderImpl::start()
 {
     mMaxTxSize = mApp.getHerder().getMaxClassicTxSize();
     {
-        LedgerTxn ltx(mApp.getLedgerTxnRoot(),
-                      /* shouldUpdateLastModified */ true,
-                      TransactionMode::READ_ONLY_WITHOUT_SQL_TXN);
-
-        uint32_t version = ltx.loadHeader().current().ledgerVersion;
+        uint32_t version = mApp.getLedgerManager()
+                               .getLastClosedLedgerHeader()
+                               .header.ledgerVersion;
         if (protocolVersionStartsFrom(version, SOROBAN_PROTOCOL_VERSION))
         {
             auto const& conf =
-                mApp.getLedgerManager().getSorobanNetworkConfig();
+                mApp.getLedgerManager().getLastClosedSorobanNetworkConfig();
             mMaxTxSize = std::max(mMaxTxSize, conf.txMaxSizeBytes() +
                                                   getFlowControlExtraBuffer());
         }
@@ -2225,7 +2281,7 @@ HerderImpl::purgeOldPersistedTxSets()
     {
         auto hashesToDelete =
             mApp.getPersistentState().getTxSetHashesForAllSlots();
-        for (auto const& state :
+        for (auto const& [_, state] :
              mApp.getPersistentState().getSCPStateAllSlots())
         {
             try
@@ -2261,6 +2317,7 @@ HerderImpl::purgeOldPersistedTxSets()
 void
 HerderImpl::trackingHeartBeat()
 {
+    releaseAssert(threadIsMain());
     if (mApp.getConfig().MANUAL_CLOSE)
     {
         return;
@@ -2325,6 +2382,15 @@ void
 HerderImpl::herderOutOfSync()
 {
     ZoneScoped;
+    // State switch from "tracking" to "out of sync" should only happen if there
+    // are no ledgers queued to be applied. If there are ledgers queued, it's
+    // possible the rest of the network is waiting for this node to vote. In
+    // this case we should _still_ remain in tracking and emit nomination; If
+    // the node does not hear anything from the network after that, then node
+    // can go into out of sync recovery.
+    releaseAssert(threadIsMain());
+    releaseAssert(!mLedgerManager.isApplying());
+
     CLOG_WARNING(Herder, "Lost track of consensus");
 
     auto s = getJsonInfo(20).toStyledString();

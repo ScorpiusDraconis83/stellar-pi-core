@@ -3,18 +3,13 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "main/CommandHandler.h"
-#include "bucket/BucketListSnapshot.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketSnapshotManager.h"
-#include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "herder/Herder.h"
 #include "history/HistoryArchiveManager.h"
-#include "ledger/InternalLedgerEntry.h"
 #include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
-#include "ledger/LedgerTxnEntry.h"
-#include "ledger/LedgerTxnImpl.h"
 #include "ledger/NetworkConfig.h"
 #include "lib/http/server.hpp"
 #include "lib/json/json.h"
@@ -25,35 +20,28 @@
 #include "overlay/BanManager.h"
 #include "overlay/OverlayManager.h"
 #include "overlay/SurveyManager.h"
-#include "transactions/InvokeHostFunctionOpFrame.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/TransactionBridge.h"
 #include "transactions/TransactionUtils.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
-#include "util/StatusManager.h"
 #include <Tracy.hpp>
 #include <fmt/format.h>
 
 #include "medida/reporting/json_reporter.h"
 #include "util/Decoder.h"
 #include "util/XDRCereal.h"
-#include "util/XDROperators.h"
 #include "util/XDRStream.h" // IWYU pragma: keep
 #include "xdr/Stellar-ledger-entries.h"
 #include "xdr/Stellar-transaction.h"
 #include "xdrpp/marshal.h"
-
-#include "ExternalQueue.h"
 
 #ifdef BUILD_TESTS
 #include "simulation/LoadGenerator.h"
 #include "test/TestAccount.h"
 #include "test/TxTests.h"
 #endif
-#include <iterator>
 #include <optional>
-#include <regex>
 
 using std::placeholders::_1;
 using std::placeholders::_2;
@@ -82,8 +70,7 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
             app.getClock().getIOContext(), ipStr, mApp.getConfig().HTTP_PORT,
             httpMaxClient);
 
-        if (mApp.getConfig().HTTP_QUERY_PORT &&
-            mApp.getConfig().isUsingBucketListDB())
+        if (mApp.getConfig().HTTP_QUERY_PORT)
         {
             mQueryServer = std::make_unique<QueryServer>(
                 ipStr, mApp.getConfig().HTTP_QUERY_PORT, httpMaxClient,
@@ -98,11 +85,8 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
     }
 
     mServer->add404(std::bind(&CommandHandler::fileNotFound, this, _1, _2));
-    if (mApp.getConfig().modeStoresAnyHistory())
+    if (mApp.getConfig().MODE_STORES_HISTORY_MISC)
     {
-        addRoute("dropcursor", &CommandHandler::dropcursor);
-        addRoute("getcursor", &CommandHandler::getcursor);
-        addRoute("setcursor", &CommandHandler::setcursor);
         addRoute("maintenance", &CommandHandler::maintenance);
     }
 
@@ -117,7 +101,6 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
         addRoute("stopsurvey", &CommandHandler::stopSurvey);
 #ifndef BUILD_TESTS
         addRoute("getsurveyresult", &CommandHandler::getSurveyResult);
-        addRoute("surveytopology", &CommandHandler::surveyTopology);
         addRoute("startsurveycollecting",
                  &CommandHandler::startSurveyCollecting);
         addRoute("stopsurveycollecting", &CommandHandler::stopSurveyCollecting);
@@ -144,7 +127,6 @@ CommandHandler::CommandHandler(Application& app) : mApp(app)
     addRoute("testacc", &CommandHandler::testAcc);
     addRoute("testtx", &CommandHandler::testTx);
     addRoute("getsurveyresult", &CommandHandler::getSurveyResult);
-    addRoute("surveytopology", &CommandHandler::surveyTopology);
     addRoute("startsurveycollecting", &CommandHandler::startSurveyCollecting);
     addRoute("stopsurveycollecting", &CommandHandler::stopSurveyCollecting);
     addRoute("surveytopologytimesliced",
@@ -760,7 +742,7 @@ CommandHandler::sorobanInfo(std::string const& params, std::string& retStr)
     ZoneScoped;
     auto& lm = mApp.getLedgerManager();
 
-    if (lm.hasSorobanNetworkConfig())
+    if (lm.hasLastClosedSorobanNetworkConfig())
     {
         std::map<std::string, std::string> retMap;
         http::server::server::parseParams(params, retMap);
@@ -777,7 +759,7 @@ CommandHandler::sorobanInfo(std::string const& params, std::string& retStr)
         if (format == "basic")
         {
             Json::Value res;
-            auto const& conf = lm.getSorobanNetworkConfig();
+            auto const& conf = lm.getLastClosedSorobanNetworkConfig();
 
             // Contract size
             res["max_contract_size"] = conf.maxContractSizeBytes();
@@ -1022,77 +1004,6 @@ CommandHandler::tx(std::string const& params, std::string& retStr)
 }
 
 void
-CommandHandler::dropcursor(std::string const& params, std::string& retStr)
-{
-    ZoneScoped;
-    std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
-    std::string const& id = map["id"];
-
-    if (!ExternalQueue::validateResourceID(id))
-    {
-        retStr = "Invalid resource id";
-    }
-    else
-    {
-        ExternalQueue ps(mApp);
-        ps.deleteCursor(id);
-        retStr = "Done";
-    }
-}
-
-void
-CommandHandler::setcursor(std::string const& params, std::string& retStr)
-{
-    ZoneScoped;
-    std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
-    std::string const& id = map["id"];
-
-    uint32 cursor = parseRequiredParam<uint32>(map, "cursor");
-
-    if (!ExternalQueue::validateResourceID(id))
-    {
-        retStr = "Invalid resource id";
-    }
-    else
-    {
-        ExternalQueue ps(mApp);
-        ps.setCursorForResource(id, cursor);
-        retStr = "Done";
-    }
-}
-
-void
-CommandHandler::getcursor(std::string const& params, std::string& retStr)
-{
-    ZoneScoped;
-    Json::Value root;
-    std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
-    std::string const& id = map["id"];
-
-    // the decision was made not to check validity here
-    // because there are subsequent checks for that in
-    // ExternalQueue and if an exception is thrown for
-    // validity there, the ret format is technically more
-    // correct for the mime type
-    ExternalQueue ps(mApp);
-    std::map<std::string, uint32> curMap;
-    int counter = 0;
-    ps.getCursorForResource(id, curMap);
-    root["cursors"][0];
-    for (auto cursor : curMap)
-    {
-        root["cursors"][counter]["id"] = cursor.first;
-        root["cursors"][counter]["cursor"] = cursor.second;
-        counter++;
-    }
-
-    retStr = root.toStyledString();
-}
-
-void
 CommandHandler::maintenance(std::string const& params, std::string& retStr)
 {
     ZoneScoped;
@@ -1139,45 +1050,9 @@ CommandHandler::checkBooted() const
 }
 
 void
-CommandHandler::surveyTopology(std::string const& params, std::string& retStr)
-{
-    ZoneScoped;
-
-    CLOG_WARNING(
-        Overlay,
-        "`surveytopology` is deprecated and will be removed in a future "
-        "release.  Please use the new time sliced survey interface.");
-
-    checkBooted();
-
-    std::map<std::string, std::string> map;
-    http::server::server::parseParams(params, map);
-
-    auto duration =
-        std::chrono::seconds(parseRequiredParam<uint32>(map, "duration"));
-    auto idString = parseRequiredParam<std::string>(map, "node");
-    NodeID id = KeyUtils::fromStrKey<NodeID>(idString);
-
-    auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
-
-    bool success = surveyManager.startSurveyReporting(
-        SurveyMessageCommandType::SURVEY_TOPOLOGY, duration);
-
-    surveyManager.addNodeToRunningSurveyBacklog(
-        SurveyMessageCommandType::SURVEY_TOPOLOGY, duration, id, std::nullopt,
-        std::nullopt);
-    retStr = "Adding node.";
-
-    retStr += success ? "Survey started " : "Survey already running!";
-}
-
-void
 CommandHandler::stopSurvey(std::string const&, std::string& retStr)
 {
     ZoneScoped;
-    CLOG_WARNING(Overlay,
-                 "`stopsurvey` is deprecated and will be removed in a future "
-                 "release.  Please use the new time sliced survey interface.");
     auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
     surveyManager.stopSurveyReporting();
     retStr = "survey stopped";
@@ -1251,14 +1126,10 @@ CommandHandler::surveyTopologyTimeSliced(std::string const& params,
 
     auto& surveyManager = mApp.getOverlayManager().getSurveyManager();
 
-    bool success = surveyManager.startSurveyReporting(
-        SurveyMessageCommandType::TIME_SLICED_SURVEY_TOPOLOGY,
-        /*surveyDuration*/ std::nullopt);
+    bool success = surveyManager.startSurveyReporting();
 
-    surveyManager.addNodeToRunningSurveyBacklog(
-        SurveyMessageCommandType::TIME_SLICED_SURVEY_TOPOLOGY,
-        /*surveyDuration*/ std::nullopt, id, inboundPeerIndex,
-        outboundPeerIndex);
+    surveyManager.addNodeToRunningSurveyBacklog(id, inboundPeerIndex,
+                                                outboundPeerIndex);
     retStr = "Adding node.";
 
     retStr += success ? "Survey started " : "Survey already running!";
@@ -1273,9 +1144,18 @@ CommandHandler::generateLoad(std::string const& params, std::string& retStr)
     {
         std::map<std::string, std::string> map;
         http::server::server::parseParams(params, map);
+        auto modeStr =
+            parseOptionalParamOrDefault<std::string>(map, "mode", "create");
+        // First check if a current run needs to be stopped
+        if (modeStr == "stop")
+        {
+            mApp.getLoadGenerator().stop();
+            retStr = "Stopped load generation";
+            return;
+        }
+
         GeneratedLoadConfig cfg;
-        cfg.mode = LoadGenerator::getMode(
-            parseOptionalParamOrDefault<std::string>(map, "mode", "create"));
+        cfg.mode = LoadGenerator::getMode(modeStr);
 
         cfg.nAccounts =
             parseOptionalParamOrDefault<uint32_t>(map, "accounts", 1000);
@@ -1387,6 +1267,13 @@ CommandHandler::generateLoad(std::string const& params, std::string& retStr)
             }
         }
 
+        if (cfg.mode == LoadGenMode::PAY_PREGENERATED)
+        {
+            // Always use the configuration file path
+            cfg.preloadedTransactionsFile =
+                mApp.getConfig().LOADGEN_PREGENERATED_TRANSACTIONS_FILE;
+        }
+
         if (cfg.maxGeneratedFeeRate)
         {
             auto baseFee = mApp.getLedgerManager().getLastTxFee();
@@ -1405,7 +1292,8 @@ CommandHandler::generateLoad(std::string const& params, std::string& retStr)
         if (cfg.mode == LoadGenMode::SOROBAN_CREATE_UPGRADE)
         {
             auto configUpgradeKey =
-                mApp.getLoadGenerator().getConfigUpgradeSetKey(cfg);
+                mApp.getLoadGenerator().getConfigUpgradeSetKey(
+                    cfg.getSorobanUpgradeConfig());
             auto configUpgradeKeyStr = stellar::decoder::encode_b64(
                 xdr::xdr_to_opaque(configUpgradeKey));
             res["config_upgrade_set_key"] = configUpgradeKeyStr;

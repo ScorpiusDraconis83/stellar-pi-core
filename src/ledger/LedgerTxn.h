@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <soci.h>
 
 /////////////////////////////////////////////////////////////////////////////
 //  Overview
@@ -262,6 +263,8 @@ enum class LedgerTxnConsistency
     EXTRA_DELETES
 };
 
+// NOTE: Remove READ_ONLY_WITHOUT_SQL_TXN mode when BucketListDB is required
+// and we stop supporting SQL backend for ledger state.
 enum class TransactionMode
 {
     READ_ONLY_WITHOUT_SQL_TXN,
@@ -274,6 +277,7 @@ struct InflationVotes;
 struct LedgerEntry;
 struct LedgerKey;
 struct LedgerRange;
+class SessionWrapper;
 
 struct OfferDescriptor
 {
@@ -308,6 +312,14 @@ struct InflationWinner
 {
     AccountID accountID;
     int64_t votes;
+};
+
+// Tracks the set of both TTL keys and corresponding code/data keys that have
+// been restored.
+struct RestoredKeys
+{
+    UnorderedSet<LedgerKey> hotArchive;
+    UnorderedSet<LedgerKey> liveBucketList;
 };
 
 class AbstractLedgerTxn;
@@ -417,6 +429,7 @@ class AbstractLedgerTxnParent
     // to trigger an atomic commit or an atomic rollback of the data stored in
     // the child.
     virtual void commitChild(EntryIterator iter,
+                             RestoredKeys const& restoredKeys,
                              LedgerTxnConsistency cons) noexcept = 0;
     virtual void rollbackChild() noexcept = 0;
 
@@ -463,60 +476,18 @@ class AbstractLedgerTxnParent
     virtual std::shared_ptr<InternalLedgerEntry const>
     getNewestVersion(InternalLedgerKey const& key) const = 0;
 
-    // Return the count of the number of ledger objects of type `let`. Will
-    // throw when called on anything other than a (real or stub) root LedgerTxn.
-    virtual uint64_t countObjects(LedgerEntryType let) const = 0;
-
-    // Return the count of the number of ledger objects of type `let` within
+    // Return the count of the number of offer objects within
     // range of ledgers `ledgers`. Will throw when called on anything other than
     // a (real or stub) root LedgerTxn.
-    virtual uint64_t countObjects(LedgerEntryType let,
-                                  LedgerRange const& ledgers) const = 0;
+    virtual uint64_t countOffers(LedgerRange const& ledgers) const = 0;
 
     // Delete all ledger entries modified on-or-after `ledger`. Will throw
     // when called on anything other than a (real or stub) root LedgerTxn.
-    virtual void
-    deleteObjectsModifiedOnOrAfterLedger(uint32_t ledger) const = 0;
-
-    // Delete all account ledger entries in the database. Will throw when called
-    // on anything other than a (real or stub) root LedgerTxn.
-    virtual void dropAccounts(bool rebuild) = 0;
-
-    // Delete all account-data ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropData(bool rebuild) = 0;
+    virtual void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const = 0;
 
     // Delete all offer ledger entries. Will throw when called on anything other
     // than a (real or stub) root LedgerTxn.
-    virtual void dropOffers(bool rebuild) = 0;
-
-    // Delete all trustline ledger entries. Will throw when called on anything
-    // other than a (real or stub) root LedgerTxn.
-    virtual void dropTrustLines(bool rebuild) = 0;
-
-    // Delete all claimable balance ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropClaimableBalances(bool rebuild) = 0;
-
-    // Delete all liquidity pool ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropLiquidityPools(bool rebuild) = 0;
-
-    // Delete all contract data ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropContractData(bool rebuild) = 0;
-
-    // Delete all contract code ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropContractCode(bool rebuild) = 0;
-
-    // Delete all config setting ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropConfigSettings(bool rebuild) = 0;
-
-    // Delete all ttl ledger entries. Will throw when called on
-    // anything other than a (real or stub) root LedgerTxn.
-    virtual void dropTTL(bool rebuild) = 0;
+    virtual void dropOffers() = 0;
 
     // Return the current cache hit rate for prefetched ledger entries, as a
     // fraction from 0.0 to 1.0. Will throw when called on anything other than a
@@ -535,6 +506,8 @@ class AbstractLedgerTxnParent
 
     // prepares to increase the capacity of pending changes by up to "s" changes
     virtual void prepareNewObjects(size_t s) = 0;
+
+    virtual SessionWrapper& getSession() const = 0;
 
 #ifdef BUILD_TESTS
     virtual void resetForFuzzer() = 0;
@@ -575,7 +548,8 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     virtual void commit() noexcept = 0;
     virtual void rollback() noexcept = 0;
 
-    // loadHeader, create, erase, load, and loadWithoutRecord provide the main
+    // loadHeader, create, erase, load, loadWithoutRecord,
+    // restoreFromHotArchive, and restoreFromLiveBucketList provide the main
     // interface to interact with data stored in the AbstractLedgerTxn. These
     // functions only allow one instance of a particular data to be active at a
     // time.
@@ -602,11 +576,25 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     //     then it will still be recorded after calling loadWithoutRecord.
     //     Throws if there is an active LedgerTxnEntry associated with this
     //     key.
+    // - restoreFromHotArchive:
+    //     Indicates that an entry in the Hot Archive has been restored. This
+    //     will create both data data/contract entry and
+    //     corresponding TTL entry. Prior to this call, the data/contract key
+    //     and TTL key must not exist in the live BucketList or any parent ltx,
+    //     throws otherwise.
+    // - restoreFromLiveBucketlist:
+    //     Indicates that an entry in the live BucketList is being restored and
+    //     updates the TTL entry accordingly. TTL key must exist, throws
+    //     otherwise.
     // All of these functions throw if the AbstractLedgerTxn is sealed or if
     // the AbstractLedgerTxn has a child.
     virtual LedgerTxnHeader loadHeader() = 0;
     virtual LedgerTxnEntry create(InternalLedgerEntry const& entry) = 0;
     virtual void erase(InternalLedgerKey const& key) = 0;
+    virtual void restoreFromHotArchive(LedgerEntry const& entry,
+                                       uint32_t ttl) = 0;
+    virtual void restoreFromLiveBucketList(LedgerKey const& key,
+                                           uint32_t ttl) = 0;
     virtual LedgerTxnEntry load(InternalLedgerKey const& key) = 0;
     virtual ConstLedgerTxnEntry
     loadWithoutRecord(InternalLedgerKey const& key) = 0;
@@ -649,6 +637,12 @@ class AbstractLedgerTxn : public AbstractLedgerTxnParent
     virtual void getAllEntries(std::vector<LedgerEntry>& initEntries,
                                std::vector<LedgerEntry>& liveEntries,
                                std::vector<LedgerKey>& deadEntries) = 0;
+    // Returns set of TTL and corresponding contract/data keys that have been
+    // restored from the Hot Archive/Live Bucket List.
+    virtual UnorderedSet<LedgerKey> const&
+    getRestoredHotArchiveKeys() const = 0;
+    virtual UnorderedSet<LedgerKey> const&
+    getRestoredLiveBucketListKeys() const = 0;
 
     // Returns all TTL keys that have been modified (create, update, and
     // delete), but does not cause the AbstractLedgerTxn or update last
@@ -740,12 +734,14 @@ class LedgerTxn : public AbstractLedgerTxn
 
     void commit() noexcept override;
 
-    void commitChild(EntryIterator iter,
+    void commitChild(EntryIterator iter, RestoredKeys const& restoredKeys,
                      LedgerTxnConsistency cons) noexcept override;
 
     LedgerTxnEntry create(InternalLedgerEntry const& entry) override;
 
     void erase(InternalLedgerKey const& key) override;
+    void restoreFromHotArchive(LedgerEntry const& entry, uint32_t ttl) override;
+    void restoreFromLiveBucketList(LedgerKey const& key, uint32_t ttl) override;
 
     UnorderedMap<LedgerKey, LedgerEntry> getAllOffers() override;
 
@@ -782,6 +778,10 @@ class LedgerTxn : public AbstractLedgerTxn
                        std::vector<LedgerKey>& deadEntries) override;
     LedgerKeySet getAllTTLKeysWithoutSealing() const override;
 
+    UnorderedSet<LedgerKey> const& getRestoredHotArchiveKeys() const override;
+    UnorderedSet<LedgerKey> const&
+    getRestoredLiveBucketListKeys() const override;
+
     std::shared_ptr<InternalLedgerEntry const>
     getNewestVersion(InternalLedgerKey const& key) const override;
 
@@ -815,20 +815,9 @@ class LedgerTxn : public AbstractLedgerTxn
 
     void unsealHeader(std::function<void(LedgerHeader&)> f) override;
 
-    uint64_t countObjects(LedgerEntryType let) const override;
-    uint64_t countObjects(LedgerEntryType let,
-                          LedgerRange const& ledgers) const override;
-    void deleteObjectsModifiedOnOrAfterLedger(uint32_t ledger) const override;
-    void dropAccounts(bool rebuild) override;
-    void dropData(bool rebuild) override;
-    void dropOffers(bool rebuild) override;
-    void dropTrustLines(bool rebuild) override;
-    void dropClaimableBalances(bool rebuild) override;
-    void dropLiquidityPools(bool rebuild) override;
-    void dropContractData(bool rebuild) override;
-    void dropContractCode(bool rebuild) override;
-    void dropConfigSettings(bool rebuild) override;
-    void dropTTL(bool rebuild) override;
+    uint64_t countOffers(LedgerRange const& ledgers) const override;
+    void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
+    void dropOffers() override;
 
     double getPrefetchHitRate() const override;
     uint32_t prefetchClassic(UnorderedSet<LedgerKey> const& keys) override;
@@ -836,6 +825,7 @@ class LedgerTxn : public AbstractLedgerTxn
     uint32_t prefetchSoroban(UnorderedSet<LedgerKey> const& keys,
                              LedgerKeyMeter* lkMeter) override;
     void prepareNewObjects(size_t s) override;
+    SessionWrapper& getSession() const override;
 
     bool hasSponsorshipEntry() const override;
 
@@ -876,25 +866,14 @@ class LedgerTxnRoot : public AbstractLedgerTxnParent
 
     void addChild(AbstractLedgerTxn& child, TransactionMode mode) override;
 
-    void commitChild(EntryIterator iter,
+    void commitChild(EntryIterator iter, RestoredKeys const& restoredKeys,
                      LedgerTxnConsistency cons) noexcept override;
 
-    uint64_t countObjects(LedgerEntryType let) const override;
-    uint64_t countObjects(LedgerEntryType let,
-                          LedgerRange const& ledgers) const override;
+    uint64_t countOffers(LedgerRange const& ledgers) const override;
 
-    void deleteObjectsModifiedOnOrAfterLedger(uint32_t ledger) const override;
+    void deleteOffersModifiedOnOrAfterLedger(uint32_t ledger) const override;
 
-    void dropAccounts(bool rebuild) override;
-    void dropData(bool rebuild) override;
-    void dropOffers(bool rebuild) override;
-    void dropTrustLines(bool rebuild) override;
-    void dropClaimableBalances(bool rebuild) override;
-    void dropLiquidityPools(bool rebuild) override;
-    void dropContractData(bool rebuild) override;
-    void dropContractCode(bool rebuild) override;
-    void dropConfigSettings(bool rebuild) override;
-    void dropTTL(bool rebuild) override;
+    void dropOffers() override;
 
 #ifdef BUILD_TESTS
     void resetForFuzzer() override;
@@ -941,5 +920,6 @@ class LedgerTxnRoot : public AbstractLedgerTxnParent
                      OfferDescriptor const* worseThan,
                      std::unordered_set<int64_t>& exclude) override;
 #endif
+    SessionWrapper& getSession() const override;
 };
 }

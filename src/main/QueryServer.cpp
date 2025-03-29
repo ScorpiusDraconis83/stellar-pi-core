@@ -3,8 +3,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "main/QueryServer.h"
-#include "bucket/BucketListSnapshot.h"
 #include "bucket/BucketSnapshotManager.h"
+#include "bucket/SearchableBucketList.h"
 #include "ledger/LedgerTxnImpl.h"
 #include "util/Logging.h"
 #include "util/XDRStream.h" // IWYU pragma: keep
@@ -56,6 +56,7 @@ QueryServer::QueryServer(const std::string& address, unsigned short port,
                          int maxClient, size_t threadPoolSize,
                          BucketSnapshotManager& bucketSnapshotManager)
     : mServer(address, port, maxClient, threadPoolSize)
+    , mBucketSnapshotManager(bucketSnapshotManager)
 {
     LOG_INFO(DEFAULT_LOG, "Listening on {}:{} for Query requests", address,
              port);
@@ -66,8 +67,8 @@ QueryServer::QueryServer(const std::string& address, unsigned short port,
     auto workerPids = mServer.start();
     for (auto pid : workerPids)
     {
-        mBucketListSnapshots[pid] =
-            std::move(bucketSnapshotManager.copySearchableBucketListSnapshot());
+        mBucketListSnapshots[pid] = std::move(
+            bucketSnapshotManager.copySearchableLiveBucketListSnapshot());
     }
 }
 
@@ -132,7 +133,11 @@ QueryServer::getLedgerEntryRaw(std::string const& params,
 
     if (!keys.empty())
     {
-        auto& bl = *mBucketListSnapshots.at(std::this_thread::get_id());
+        auto& snapshotPtr = mBucketListSnapshots.at(std::this_thread::get_id());
+        mBucketSnapshotManager.maybeCopySearchableBucketListSnapshot(
+            snapshotPtr);
+
+        auto& bl = *snapshotPtr;
 
         LedgerKeySet orderedKeys;
         for (auto const& key : keys)
@@ -149,22 +154,23 @@ QueryServer::getLedgerEntryRaw(std::string const& params,
         {
             root["ledgerSeq"] = *snapshotLedger;
 
-            bool snapshotExists;
-            std::tie(loadedKeys, snapshotExists) =
+            auto loadedKeysOp =
                 bl.loadKeysFromLedger(orderedKeys, *snapshotLedger);
 
             // Return 404 if ledgerSeq not found
-            if (!snapshotExists)
+            if (!loadedKeysOp)
             {
                 retStr = "LedgerSeq not found";
                 return false;
             }
+
+            loadedKeys = std::move(*loadedKeysOp);
         }
         // Otherwise default to current ledger
         else
         {
-            loadedKeys =
-                bl.loadKeysWithLimits(orderedKeys, /*lkMeter=*/nullptr);
+            loadedKeys = bl.loadKeysWithLimits(orderedKeys, "query",
+                                               /*lkMeter=*/nullptr);
             root["ledgerSeq"] = bl.getLedgerSeq();
         }
 

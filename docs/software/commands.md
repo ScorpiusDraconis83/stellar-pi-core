@@ -19,6 +19,19 @@ Common options can be placed at any place in the command line.
 ## Command line options
 Command options can only by placed after command.
 
+* **apply-load**: Applies Soroban transactions by repeatedly generating transactions and closing
+them directly through the LedgerManager. This command will generate enough transactions to fill up a synthetic transaction queue (it's just a list of transactions with the same limits as the real queue), and then create a transaction set off of that to
+apply.
+
+* At the moment, the Soroban transactions are generated using some of the same config parameters as the **generateload** command. Specifically,
+    `ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING=true`,
+    `LOADGEN_INSTRUCTIONS_FOR_TESTING`, and
+    `LOADGEN_INSTRUCTIONS_DISTRIBUTION_FOR_TESTING`. In addition to those, you must also set the
+    limit related settings - `APPLY_LOAD_LEDGER_MAX_INSTRUCTIONS`, `APPLY_LOAD_TX_MAX_INSTRUCTIONS`, `APPLY_LOAD_LEDGER_MAX_READ_LEDGER_ENTRIES`, `APPLY_LOAD_TX_MAX_READ_LEDGER_ENTRIES`, `APPLY_LOAD_LEDGER_MAX_WRITE_LEDGER_ENTRIES`, `APPLY_LOAD_TX_MAX_WRITE_LEDGER_ENTRIES`, `APPLY_LOAD_LEDGER_MAX_READ_BYTES`, `APPLY_LOAD_TX_MAX_READ_BYTES`, `APPLY_LOAD_LEDGER_MAX_WRITE_BYTES`, `APPLY_LOAD_TX_MAX_WRITE_BYTES`, `APPLY_LOAD_MAX_TX_SIZE_BYTES`, `APPLY_LOAD_MAX_LEDGER_TX_SIZE_BYTES`, `APPLY_LOAD_MAX_CONTRACT_EVENT_SIZE_BYTES`, `APPLY_LOAD_MAX_TX_COUNT`.
+* `apply-load` will also generate a synthetic bucket list using `APPLY_LOAD_BL_SIMULATED_LEDGERS`, `APPLY_LOAD_BL_WRITE_FREQUENCY`, `APPLY_LOAD_BL_BATCH_SIZE`, `APPLY_LOAD_BL_LAST_BATCH_LEDGERS`, `APPLY_LOAD_BL_LAST_BATCH_SIZE`. These have default values set in `Config.h`.
+* There are additional `APPLY_LOAD_*` related config settings that can be used to configure
+`apply-load`, and you can learn more about these from the comments in `Config.h`.
+
 * **catchup <DESTINATION-LEDGER/LEDGER-COUNT>**: Perform catchup from history
   archives without connecting to network. For new instances (with empty history
   tables - only ledger 1 present in the database) it will respect LEDGER-COUNT
@@ -144,12 +157,6 @@ Command options can only by placed after command.
 * **run**: Runs stellar-core service.<br>
   Option **--wait-for-consensus** lets validators wait to hear from the network
   before participating in consensus.<br>
-  (deprecated) Option **--in-memory** stores the current ledger in memory rather than a
-  database.<br>
-  (deprecated) Option **--start-at-ledger <N>** starts **--in-memory** mode with a catchup to
-  ledger **N** then replays to the current state of the network.<br>
-  (deprecated) Option **--start-at-hash <HASH>** provides a (mandatory) hash for the ledger
-  **N** specified by the **--start-at-ledger** option.
 * **sec-to-pub**:  Reads a secret key on standard input and outputs the
   corresponding public key.  Both keys are in Stellar's standard
   base-32 ASCII format.
@@ -193,9 +200,30 @@ Command options can only by placed after command.
   hash for a checkpoint ledger, and then verifies the entire earlier history
   of an archive that ends in that ledger hash, writing the output to a reference
   list of trusted checkpoint hashes.
-  Option **--output-filename <FILE-NAME>** is mandatory and specifies the file
-  to write the trusted checkpoint hashes to.
+  * Option **--history-hash <HASH>** is optional and specifies the hash of the ledger
+  at the end of the verification range. When provided, `stellar-core` will use the history
+  hash to verify the range, rather than the latest checkpoint hash obtained from consensus.
+  Used in conjunction with `--history-ledger`.
+  * Option **--history-ledger <LEDGER-NUMBER>** is optional and specifies the ledger
+  number to end the verification at.  Used in conjunction with `--history-hash`.
+  * Option **--output-filename <FILE-NAME>** is mandatory and specifies the file
+  to write the trusted checkpoint hashes to. The file will contain a JSON array 
+  of arrays, where each inner array contains the ledger number and the corresponding
+  checkpoint hash of the form `[[999, "hash-abc"], [935, "hash-def"], ... [0, "hash-xyz]]`.
+  * Option **--trusted-hash-file <FILE-NAME>** is optional. If provided,
+  stellar-core will parse the latest checkpoint ledger number and hash from the file and verify from this ledger to the latest checkpoint ledger obtained from the network.
+  * Option **--from-ledger <LEDGER-NUMBER>** is optional and specifies the ledger
+  number to start the verification from.
+
+> Note: It is an error to provide both the `--trusted-hash-file` and `--from-ledger` options.
+
 * **version**: Print version info and then exit.
+
+* **pregenerate-loadgen-txs**: Generate payment transactions XDR file for load testing. This command creates a file with pre-generated payment transactions that can be used with the `generateload` HTTP command (specifically the `pay_pregenerated` mode). This improves performance when running load tests with large numbers of transactions since signature verification and tx generation can be skipped.
+  * `--count NUM-TRANSACTIONS` - number of transactions to generate (default: 1000)
+  * `--accounts NUM-ACCOUNTS` - number of test accounts to use (default: 100)
+  * `--offset OFFSET` - offset for account selection (default: 0)
+  * `--output-file FILE-NAME` - file to write the generated transactions to (required)
 
 ## HTTP Commands
 Stellar-core maintains two HTTP servers, a command server and a query server.
@@ -218,11 +246,6 @@ Most commands return their results in JSON format.
 * **connect**
   `connect?peer=NAME&port=NNN`<br>
   Triggers the instance to connect to peer NAME at port NNN.
-
-* **dropcursor**  
-  `dropcursor?id=ID`<br>
-  Deletes the tracking cursor identified by `id`. See `setcursor` for
-  more information.
 
 * **droppeer**
   `droppeer?node=NODE_ID[&ban=D]`<br>
@@ -282,23 +305,6 @@ Most commands return their results in JSON format.
   * `delayed`: participating in the latest consensus rounds, but slower than others.
   * `agree`: running just fine.
 
-* **setcursor**
-  `setcursor?id=ID&cursor=N`<br>
-  Sets or creates a cursor identified by `ID` with value `N`. ID is an
-  uppercase AlphaNum, N is an uint32 that represents the last ledger sequence
-  number that the instance ID processed. Cursors are used by dependent services
-  to tell stellar-core which data can be safely deleted by the instance. The
-  data is historical data stored in the SQL tables such as txhistory or
-  ledgerheaders. When all consumers processed the data for ledger sequence N
-  the data can be safely removed by the instance. The actual deletion is
-  performed by invoking the `maintenance` endpoint or on startup. See also
-  `dropcursor`.
-
-* **getcursor**
-  `getcursor?[id=ID]`<br>
-  Gets the cursor identified by `ID`. If ID is not defined then all cursors
-  will be returned.
-
 * **scp**
   `scp?[limit=n][&fullkeys=false]`<br>
   Returns a JSON object with the internal state of the SCP engine for the last
@@ -315,6 +321,10 @@ Most commands return their results in JSON format.
     * "ERROR" - transaction rejected by transaction engine
         error: set when status is "ERROR".
             Base64 encoded, XDR serialized 'TransactionResult'
+    * "TRY_AGAIN_LATER" - transaction rejected but can be retried later. This can happen due to several reasons:
+        There is another transaction from same source account in PENDING state
+        The network is under high load and the fee is too low.
+    * "FILTERED" - transaction rejected because it contains an operation type that Stellar Core filters out. See Stellar Core configuration `EXCLUDE_TRANSACTIONS_CONTAINING_OPERATION_TYPE` for more details.
 
 * **upgrades**
   * `upgrades?mode=get`<br>
@@ -366,7 +376,7 @@ Most commands return their results in JSON format.
       and dump it as base64 xdr. This can be used along with the `stellar-xdr` command line tool
       to dump the current settings in the same format as the JSON file we use for upgrades. This
       is helpful if you want to make settings changes off of the current settings.
-      Ex. `curl -s "127.0.0.1:11626/sorobaninfo?format=upgrade_xdr" | stellar-xdr decode --type ConfigUpgradeSet`
+      Ex. `curl -s "127.0.0.1:11626/sorobaninfo?format=upgrade_xdr" | stellar-xdr decode --type ConfigUpgradeSet --output json-formatted`
 
 * **dumpproposedsettings**
   `dumpproposedsettings?blob=Base64`<br>
@@ -393,9 +403,6 @@ Most commands return their results in JSON format.
 
 * **stopsurvey**
   `stopsurvey`<br>
-  **This command is deprecated and will be removed in a future release. It is no
-  longer necessary to explicitly stop a survey in the new time sliced survey
-  interface as these surveys expire automatically.**
   Will stop the survey if one is running. Noop if no survey is running
 
 * **startsurveycollecting**
@@ -442,13 +449,19 @@ this survey mechanism, just set `SURVEYOR_KEYS` to `$self` or a bogus key
 
 ### The following HTTP commands are exposed on test instances
 * **generateload** `generateload[?mode=
-    (create|pay|pretend|mixed_classic|soroban_upload|soroban_invoke_setup|soroban_invoke|upgrade_setup|create_upgrade|mixed_classic_soroban)&accounts=N&offset=K&txs=M&txrate=R&spikesize=S&spikeinterval=I&maxfeerate=F&skiplowfeetxs=(0|1)&dextxpercent=D&minpercentsuccess=S&instances=Y&wasms=Z&payweight=P&sorobanuploadweight=Q&sorobaninvokeweight=R]`
+    (create|pay|pretend|mixed_classic|soroban_upload|soroban_invoke_setup|soroban_invoke|upgrade_setup|create_upgrade|mixed_classic_soroban|pay_pregenerated|stop)&accounts=N&offset=K&txs=M&txrate=R&spikesize=S&spikeinterval=I&maxfeerate=F&skiplowfeetxs=(0|1)&dextxpercent=D&minpercentsuccess=S&instances=Y&wasms=Z&payweight=P&sorobanuploadweight=Q&sorobaninvokeweight=R&file=F]`
 
     Artificially generate load for testing; must be used with
     `ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING` set to true.
   * `create` mode creates new accounts. Batches 100 creation operations per transaction.
   * `pay` mode generates `PaymentOp` transactions on accounts specified
     (where the number of accounts can be offset).
+  * `pay_pregenerated` mode submits pre-generated payment transactions from an XDR file.
+    This mode skips signature verification for better performance when testing with
+    large numbers of transactions. Use the `LOADGEN_PREGENERATED_TRANSACTIONS_FILE`
+    config to specify the path to the XDR file containing the pre-generated transactions.
+    To generate a file with pre-generated transactions, use the
+    `pregenerate-loadgen-txs` command.
   * `pretend` mode generates transactions on accounts specified(where the number
     of accounts can be offset). Operations in `pretend` mode are designed to
     have a realistic size to help users "pretend" that they have real traffic.
@@ -503,6 +516,7 @@ this survey mechanism, just set `SURVEYOR_KEYS` to `$self` or a bogus key
     `soroban_upload`, and `soroban_invoke` load with the likelihood of any
     generated transaction falling into each mode being determined by the mode's
     weight divided by the sum of all weights.
+  * `stop` mode stops any existing load generation run and marks it as "failed".
 
   Non-`create` load generation makes use of the additional parameters:
   * when a nonzero `spikeinterval` is given, a spike will occur every

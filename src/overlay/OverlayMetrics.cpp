@@ -43,14 +43,14 @@ OverlayMetrics::OverlayMetrics(Application& app)
     , mRecvAuthTimer(app.getMetrics().NewTimer({"overlay", "recv", "auth"}))
     , mRecvDontHaveTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "dont-have"}))
-    , mRecvGetPeersTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "get-peers"}))
     , mRecvPeersTimer(app.getMetrics().NewTimer({"overlay", "recv", "peers"}))
     , mRecvGetTxSetTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "get-txset"}))
     , mRecvTxSetTimer(app.getMetrics().NewTimer({"overlay", "recv", "txset"}))
-    , mRecvTransactionTimer(
-          app.getMetrics().NewTimer({"overlay", "recv", "transaction"}))
+    , mRecvTransactionAccumulator(
+          app.getMetrics().NewCounter({"overlay", "recv-transaction", "sum"}))
+    , mRecvTransactionCounter(
+          app.getMetrics().NewCounter({"overlay", "recv-transaction", "count"}))
     , mRecvGetSCPQuorumSetTimer(
           app.getMetrics().NewTimer({"overlay", "recv", "get-scp-qset"}))
     , mRecvSCPQuorumSetTimer(
@@ -114,8 +114,6 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewMeter({"overlay", "send", "auth"}, "message"))
     , mSendDontHaveMeter(app.getMetrics().NewMeter(
           {"overlay", "send", "dont-have"}, "message"))
-    , mSendGetPeersMeter(app.getMetrics().NewMeter(
-          {"overlay", "send", "get-peers"}, "message"))
     , mSendPeersMeter(
           app.getMetrics().NewMeter({"overlay", "send", "peers"}, "message"))
     , mSendGetTxSetMeter(app.getMetrics().NewMeter(
@@ -158,8 +156,6 @@ OverlayMetrics::OverlayMetrics(Application& app)
           app.getMetrics().NewTimer({"overlay", "flood", "tx-pull-latency"}))
     , mPeerTxPullLatency(app.getMetrics().NewTimer(
           {"overlay", "flood", "peer-tx-pull-latency"}))
-    , mAdvertQueueDelay(
-          app.getMetrics().NewTimer({"overlay", "flood", "advert-delay"}))
     , mDemandTimeouts(app.getMetrics().NewMeter(
           {"overlay", "demand", "timeout"}, "timeout"))
     , mPulledRelevantTxs(app.getMetrics().NewMeter(

@@ -3,171 +3,143 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/BucketSnapshotManager.h"
-#include "bucket/BucketListSnapshot.h"
+#include "bucket/BucketUtils.h"
+#include "bucket/HotArchiveBucket.h"
+#include "bucket/LiveBucket.h"
+#include "bucket/SearchableBucketList.h"
+#include "main/AppConnector.h"
 #include "main/Application.h"
+#include "util/GlobalChecks.h"
 #include "util/XDRStream.h" // IWYU pragma: keep
 
-#include "medida/meter.h"
-#include "medida/metrics_registry.h"
 #include <shared_mutex>
+#include <xdrpp/types.h>
 
 namespace stellar
 {
 
 BucketSnapshotManager::BucketSnapshotManager(
-    Application& app, std::unique_ptr<BucketListSnapshot const>&& snapshot,
-    uint32_t numHistoricalSnapshots)
-    : mApp(app)
-    , mCurrentSnapshot(std::move(snapshot))
-    , mHistoricalSnapshots()
-    , mNumHistoricalSnapshots(numHistoricalSnapshots)
-    , mBulkLoadMeter(app.getMetrics().NewMeter(
-          {"bucketlistDB", "query", "loads"}, "query"))
-    , mBloomMisses(app.getMetrics().NewMeter(
-          {"bucketlistDB", "bloom", "misses"}, "bloom"))
-    , mBloomLookups(app.getMetrics().NewMeter(
-          {"bucketlistDB", "bloom", "lookups"}, "bloom"))
+    Application& app, SnapshotPtrT<LiveBucket>&& snapshot,
+    SnapshotPtrT<HotArchiveBucket>&& hotArchiveSnapshot,
+    uint32_t numLiveHistoricalSnapshots)
+    : mAppConnector(app)
+    , mCurrLiveSnapshot(std::move(snapshot))
+    , mCurrHotArchiveSnapshot(std::move(hotArchiveSnapshot))
+    , mLiveHistoricalSnapshots()
+    , mHotArchiveHistoricalSnapshots()
+    , mNumHistoricalSnapshots(numLiveHistoricalSnapshots)
 {
     releaseAssert(threadIsMain());
+    releaseAssert(mCurrLiveSnapshot);
+    releaseAssert(mCurrHotArchiveSnapshot);
 }
 
-std::shared_ptr<SearchableBucketListSnapshot>
-BucketSnapshotManager::copySearchableBucketListSnapshot() const
+template <class BucketT>
+std::map<uint32_t, SnapshotPtrT<BucketT>>
+copyHistoricalSnapshots(
+    std::map<uint32_t, SnapshotPtrT<BucketT>> const& snapshots)
+{
+    std::map<uint32_t, SnapshotPtrT<BucketT>> copiedSnapshots;
+    for (auto const& [ledgerSeq, snap] : snapshots)
+    {
+        copiedSnapshots.emplace(
+            ledgerSeq,
+            std::make_unique<BucketListSnapshot<BucketT> const>(*snap));
+    }
+    return copiedSnapshots;
+}
+
+SearchableSnapshotConstPtr
+BucketSnapshotManager::copySearchableLiveBucketListSnapshot() const
 {
     // Can't use std::make_shared due to private constructor
-    return std::shared_ptr<SearchableBucketListSnapshot>(
-        new SearchableBucketListSnapshot(*this));
+    return std::shared_ptr<SearchableLiveBucketListSnapshot>(
+        new SearchableLiveBucketListSnapshot(
+            *this, mAppConnector,
+            std::make_unique<BucketListSnapshot<LiveBucket>>(
+                *mCurrLiveSnapshot),
+            copyHistoricalSnapshots(mLiveHistoricalSnapshots)));
 }
 
-medida::Timer&
-BucketSnapshotManager::recordBulkLoadMetrics(std::string const& label,
-                                             size_t numEntries) const
+SearchableHotArchiveSnapshotConstPtr
+BucketSnapshotManager::copySearchableHotArchiveBucketListSnapshot() const
 {
-    // For now, only keep metrics for the main thread. We can decide on what
-    // metrics make sense when more background services are added later.
-    releaseAssert(threadIsMain());
-
-    if (numEntries != 0)
-    {
-        mBulkLoadMeter.Mark(numEntries);
-    }
-
-    auto iter = mBulkTimers.find(label);
-    if (iter == mBulkTimers.end())
-    {
-        auto& metric =
-            mApp.getMetrics().NewTimer({"bucketlistDB", "bulk", label});
-        iter = mBulkTimers.emplace(label, metric).first;
-    }
-
-    return iter->second;
+    releaseAssert(mCurrHotArchiveSnapshot);
+    // Can't use std::make_shared due to private constructor
+    return std::shared_ptr<SearchableHotArchiveBucketListSnapshot>(
+        new SearchableHotArchiveBucketListSnapshot(
+            *this, mAppConnector,
+            std::make_unique<BucketListSnapshot<HotArchiveBucket>>(
+                *mCurrHotArchiveSnapshot),
+            copyHistoricalSnapshots(mHotArchiveHistoricalSnapshots)));
 }
 
 void
-BucketSnapshotManager::maybeUpdateSnapshot(
-    std::unique_ptr<BucketListSnapshot const>& snapshot,
-    std::map<uint32_t, std::unique_ptr<BucketListSnapshot const>>&
-        historicalSnapshots) const
+BucketSnapshotManager::maybeCopySearchableBucketListSnapshot(
+    SearchableSnapshotConstPtr& snapshot)
 {
     // The canonical snapshot held by the BucketSnapshotManager is not being
     // modified. Rather, a thread is checking it's copy against the canonical
     // snapshot, so use a shared lock.
     std::shared_lock<std::shared_mutex> lock(mSnapshotMutex);
 
-    // First update current snapshot
     if (!snapshot ||
-        snapshot->getLedgerSeq() != mCurrentSnapshot->getLedgerSeq())
+        snapshot->getLedgerSeq() < mCurrLiveSnapshot->getLedgerSeq())
     {
-        // Should only update with a newer snapshot
-        releaseAssert(!snapshot || snapshot->getLedgerSeq() <
-                                       mCurrentSnapshot->getLedgerSeq());
-        snapshot = std::make_unique<BucketListSnapshot>(*mCurrentSnapshot);
+        snapshot = copySearchableLiveBucketListSnapshot();
     }
+}
 
-    // Then update historical snapshots (if any exist)
-    if (mHistoricalSnapshots.empty())
-    {
-        return;
-    }
+void
+BucketSnapshotManager::maybeCopySearchableHotArchiveBucketListSnapshot(
+    SearchableHotArchiveSnapshotConstPtr& snapshot)
+{
+    // The canonical snapshot held by the BucketSnapshotManager is not being
+    // modified. Rather, a thread is checking it's copy against the canonical
+    // snapshot, so use a shared lock.
+    std::shared_lock<std::shared_mutex> lock(mSnapshotMutex);
 
-    // If size of manager's history map is different, or if the oldest snapshot
-    // ledger seq is different, we need to update.
-    if (mHistoricalSnapshots.size() != historicalSnapshots.size() ||
-        mHistoricalSnapshots.begin()->first !=
-            historicalSnapshots.begin()->first)
+    if (!snapshot ||
+        snapshot->getLedgerSeq() < mCurrHotArchiveSnapshot->getLedgerSeq())
     {
-        // Copy current snapshot map into historicalSnapshots
-        historicalSnapshots.clear();
-        for (auto const& [ledgerSeq, snap] : mHistoricalSnapshots)
-        {
-            historicalSnapshots.emplace(
-                ledgerSeq, std::make_unique<BucketListSnapshot>(*snap));
-        }
+        snapshot = copySearchableHotArchiveBucketListSnapshot();
     }
 }
 
 void
 BucketSnapshotManager::updateCurrentSnapshot(
-    std::unique_ptr<BucketListSnapshot const>&& newSnapshot)
+    SnapshotPtrT<LiveBucket>&& liveSnapshot,
+    SnapshotPtrT<HotArchiveBucket>&& hotArchiveSnapshot)
 {
-    releaseAssert(newSnapshot);
-    releaseAssert(threadIsMain());
+    auto updateSnapshot = [numHistoricalSnapshots = mNumHistoricalSnapshots](
+                              auto& currentSnapshot, auto& historicalSnapshots,
+                              auto&& newSnapshot) {
+        releaseAssert(newSnapshot);
+        releaseAssert(!currentSnapshot || newSnapshot->getLedgerSeq() >=
+                                              currentSnapshot->getLedgerSeq());
+
+        // First update historical snapshots
+        if (numHistoricalSnapshots != 0)
+        {
+            // If historical snapshots are full, delete the oldest one
+            if (historicalSnapshots.size() == numHistoricalSnapshots)
+            {
+                historicalSnapshots.erase(historicalSnapshots.begin());
+            }
+
+            historicalSnapshots.emplace(currentSnapshot->getLedgerSeq(),
+                                        std::move(currentSnapshot));
+            currentSnapshot = nullptr;
+        }
+
+        currentSnapshot.swap(newSnapshot);
+    };
 
     // Updating the BucketSnapshotManager canonical snapshot, must lock
     // exclusively for write access.
     std::unique_lock<std::shared_mutex> lock(mSnapshotMutex);
-    releaseAssert(!mCurrentSnapshot || newSnapshot->getLedgerSeq() >=
-                                           mCurrentSnapshot->getLedgerSeq());
-
-    // First update historical snapshots
-    if (mNumHistoricalSnapshots != 0)
-    {
-        // If historical snapshots are full, delete the oldest one
-        if (mHistoricalSnapshots.size() == mNumHistoricalSnapshots)
-        {
-            mHistoricalSnapshots.erase(mHistoricalSnapshots.begin());
-        }
-
-        mHistoricalSnapshots.emplace(mCurrentSnapshot->getLedgerSeq(),
-                                     std::move(mCurrentSnapshot));
-        mCurrentSnapshot = nullptr;
-    }
-
-    mCurrentSnapshot.swap(newSnapshot);
-}
-
-void
-BucketSnapshotManager::startPointLoadTimer() const
-{
-    releaseAssert(threadIsMain());
-    releaseAssert(!mTimerStart);
-    mTimerStart = mApp.getClock().now();
-}
-
-void
-BucketSnapshotManager::endPointLoadTimer(LedgerEntryType t,
-                                         bool bloomMiss) const
-{
-    releaseAssert(threadIsMain());
-    releaseAssert(mTimerStart);
-    auto duration = mApp.getClock().now() - *mTimerStart;
-    mTimerStart.reset();
-
-    // We expect about 0.1% of lookups to encounter a bloom miss. To avoid noise
-    // in disk performance metrics, we only track metrics for entries that did
-    // not encounter a bloom miss.
-    if (!bloomMiss)
-    {
-        auto iter = mPointTimers.find(t);
-        if (iter == mPointTimers.end())
-        {
-            auto const& label = xdr::xdr_traits<LedgerEntryType>::enum_name(t);
-            auto& metric =
-                mApp.getMetrics().NewTimer({"bucketlistDB", "point", label});
-            iter = mPointTimers.emplace(t, metric).first;
-        }
-
-        iter->second.Update(duration);
-    }
+    updateSnapshot(mCurrLiveSnapshot, mLiveHistoricalSnapshots, liveSnapshot);
+    updateSnapshot(mCurrHotArchiveSnapshot, mHotArchiveHistoricalSnapshots,
+                   hotArchiveSnapshot);
 }
 }

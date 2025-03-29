@@ -34,7 +34,7 @@ TEST_CASE_VERSIONS("confirm and clear sponsor", "[tx][sponsorship]")
 {
     VirtualClock clock;
     auto app = createTestApplication(
-        clock, getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS));
+        clock, getTestConfig(0, Config::TESTDB_IN_MEMORY));
 
     auto root = TestAccount::createRoot(*app);
     int64_t minBalance = app->getLedgerManager().getLastMinBalance(0);
@@ -48,7 +48,8 @@ TEST_CASE_VERSIONS("confirm and clear sponsor", "[tx][sponsorship]")
                 {root.op(endSponsoringFutureReserves())}, {});
 
             LedgerTxn ltx(app->getLedgerTxnRoot());
-            REQUIRE(!tx->checkValidForTesting(*app, ltx, 0, 0, 0));
+            REQUIRE(!tx->checkValidForTesting(app->getAppConnector(), ltx, 0, 0,
+                                              0));
 
             REQUIRE(getOperationResultCode(tx, 0) == opNOT_SUPPORTED);
         });
@@ -64,8 +65,9 @@ TEST_CASE_VERSIONS("confirm and clear sponsor", "[tx][sponsorship]")
 
             LedgerTxn ltx(app->getLedgerTxnRoot());
             TransactionMetaFrame txm(ltx.loadHeader().current().ledgerVersion);
-            REQUIRE(tx->checkValidForTesting(*app, ltx, 0, 0, 0));
-            REQUIRE(!tx->apply(*app, ltx, txm));
+            REQUIRE(
+                tx->checkValidForTesting(app->getAppConnector(), ltx, 0, 0, 0));
+            REQUIRE(!tx->apply(app->getAppConnector(), ltx, txm));
 
             REQUIRE(tx->getResult().result.code() == txFAILED);
             REQUIRE(getEndSponsoringFutureReservesResultCode(tx, 0) ==

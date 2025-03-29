@@ -3,9 +3,9 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "ledger/LedgerStateSnapshot.h"
-#include "bucket/BucketListSnapshot.h"
 #include "bucket/BucketManager.h"
 #include "bucket/BucketSnapshotManager.h"
+#include "ledger/LedgerManager.h"
 #include "ledger/LedgerTxn.h"
 #include "main/Application.h"
 #include "transactions/TransactionFrame.h"
@@ -25,7 +25,7 @@ LedgerEntryWrapper::LedgerEntryWrapper(LedgerTxnEntry&& entry)
 {
 }
 
-LedgerEntryWrapper::LedgerEntryWrapper(std::shared_ptr<LedgerEntry> entry)
+LedgerEntryWrapper::LedgerEntryWrapper(std::shared_ptr<LedgerEntry const> entry)
     : mEntry(entry)
 {
 }
@@ -163,8 +163,8 @@ LedgerTxnReadOnly::executeWithMaybeInnerSnapshot(
     return f(lsg);
 }
 
-BucketSnapshotState::BucketSnapshotState(BucketManager& bm)
-    : mSnapshot(bm.getSearchableBucketListSnapshot())
+BucketSnapshotState::BucketSnapshotState(SearchableSnapshotConstPtr snapshot)
+    : mSnapshot(snapshot)
     , mLedgerHeader(LedgerHeaderWrapper(
           std::make_shared<LedgerHeader>(mSnapshot->getLedgerHeader())))
 {
@@ -223,7 +223,9 @@ LedgerSnapshot::LedgerSnapshot(AbstractLedgerTxn& ltx)
 
 LedgerSnapshot::LedgerSnapshot(Application& app)
 {
-    if (app.getConfig().DEPRECATED_SQL_LEDGER_STATE)
+    releaseAssert(threadIsMain());
+#ifdef BUILD_TESTS
+    if (app.getConfig().MODE_USES_IN_MEMORY_LEDGER)
     {
         // Legacy read-only SQL transaction
         mLegacyLedgerTxn = std::make_unique<LedgerTxn>(
@@ -232,9 +234,9 @@ LedgerSnapshot::LedgerSnapshot(Application& app)
         mGetter = std::make_unique<LedgerTxnReadOnly>(*mLegacyLedgerTxn);
     }
     else
-    {
-        mGetter = std::make_unique<BucketSnapshotState>(app.getBucketManager());
-    }
+#endif
+        mGetter = std::make_unique<BucketSnapshotState>(
+            app.getLedgerManager().getLastClosedSnaphot());
 }
 
 LedgerHeaderWrapper

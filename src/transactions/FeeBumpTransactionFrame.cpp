@@ -11,6 +11,7 @@
 #include "ledger/LedgerTxn.h"
 #include "ledger/LedgerTxnEntry.h"
 #include "ledger/LedgerTxnHeader.h"
+#include "main/AppConnector.h"
 #include "main/Application.h"
 #include "transactions/MutableTransactionResult.h"
 #include "transactions/SignatureChecker.h"
@@ -73,7 +74,7 @@ FeeBumpTransactionFrame::FeeBumpTransactionFrame(
 #endif
 
 bool
-FeeBumpTransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
+FeeBumpTransactionFrame::apply(AppConnector& app, AbstractLedgerTxn& ltx,
                                TransactionMetaFrame& meta,
                                MutableTxResultPtr txResult,
                                Hash const& sorobanBasePrngSeed) const
@@ -122,7 +123,7 @@ FeeBumpTransactionFrame::apply(Application& app, AbstractLedgerTxn& ltx,
 }
 
 void
-FeeBumpTransactionFrame::processPostApply(Application& app,
+FeeBumpTransactionFrame::processPostApply(AppConnector& app,
                                           AbstractLedgerTxn& ltx,
                                           TransactionMetaFrame& meta,
                                           MutableTxResultPtr txResult) const
@@ -132,8 +133,7 @@ FeeBumpTransactionFrame::processPostApply(Application& app,
     // Note that we are not calling TransactionFrame::processPostApply, so if
     // any logic is added there, we would have to reason through if that logic
     // should also be reflected here.
-    int64_t refund =
-        mInnerTx->processRefund(app, ltx, meta, getFeeSourceID(), *txResult);
+    mInnerTx->processRefund(app, ltx, meta, getFeeSourceID(), *txResult);
 }
 
 bool
@@ -154,12 +154,14 @@ FeeBumpTransactionFrame::checkSignature(SignatureChecker& signatureChecker,
 }
 
 MutableTxResultPtr
-FeeBumpTransactionFrame::checkValid(Application& app, LedgerSnapshot const& ls,
+FeeBumpTransactionFrame::checkValid(AppConnector& app, LedgerSnapshot const& ls,
                                     SequenceNumber current,
                                     uint64_t lowerBoundCloseTimeOffset,
                                     uint64_t upperBoundCloseTimeOffset) const
 {
-    if (!isTransactionXDRValidForCurrentProtocol(app, mEnvelope) ||
+    if (!isTransactionXDRValidForProtocol(
+            ls.getLedgerHeader().current().ledgerVersion, app.getConfig(),
+            mEnvelope) ||
         !XDRProvidesValidFee())
     {
         auto txResult = createSuccessResult();
@@ -197,9 +199,10 @@ FeeBumpTransactionFrame::checkValid(Application& app, LedgerSnapshot const& ls,
 
 bool
 FeeBumpTransactionFrame::checkSorobanResourceAndSetError(
-    Application& app, uint32_t ledgerVersion, MutableTxResultPtr txResult) const
+    AppConnector& app, SorobanNetworkConfig const& cfg, uint32_t ledgerVersion,
+    MutableTxResultPtr txResult) const
 {
-    return mInnerTx->checkSorobanResourceAndSetError(app, ledgerVersion,
+    return mInnerTx->checkSorobanResourceAndSetError(app, cfg, ledgerVersion,
                                                      txResult);
 }
 

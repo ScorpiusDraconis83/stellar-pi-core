@@ -140,8 +140,8 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
 {
     VirtualClock clock;
 
-    auto cfg1 = getTestConfig(0, Config::TESTDB_IN_MEMORY_NO_OFFERS);
-    auto cfg2 = getTestConfig(1, Config::TESTDB_IN_MEMORY_NO_OFFERS);
+    auto cfg1 = getTestConfig(0, Config::TESTDB_IN_MEMORY);
+    auto cfg2 = getTestConfig(1, Config::TESTDB_IN_MEMORY);
     REQUIRE(cfg1.PEER_FLOOD_READING_CAPACITY !=
             cfg1.PEER_FLOOD_READING_CAPACITY_BYTES);
 
@@ -188,7 +188,8 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
         REQUIRE(conn.getAcceptor()->checkCapacity(conn.getInitiator()));
 
         uint64_t expectedCapacity{0};
-        expectedCapacity = cfg2.PEER_FLOOD_READING_CAPACITY_BYTES - txSize;
+        expectedCapacity =
+            app2->getOverlayManager().getFlowControlBytesTotal() - txSize;
 
         SECTION("basic capacity accounting")
         {
@@ -202,9 +203,8 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
                         ->getCapacityBytes()
                         .getOutboundCapacity() == expectedCapacity);
             REQUIRE(conn.getInitiator()->getTxQueueByteCount() == 0);
-            auto msgTracker =
-                std::make_shared<LoopbackPeer::MsgCapacityTracker>(
-                    conn.getAcceptor(), tx1);
+            auto msgTracker = std::make_shared<CapacityTrackedMessage>(
+                conn.getAcceptor(), tx1);
             conn.getAcceptor()->recvMessage(msgTracker);
             REQUIRE(conn.getAcceptor()
                         ->getFlowControl()
@@ -238,7 +238,7 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
                         ->getCapacityBytes()
                         .getCapacity()
                         .mFloodCapacity ==
-                    cfg2.PEER_FLOOD_READING_CAPACITY_BYTES);
+                    app2->getOverlayManager().getFlowControlBytesTotal());
             if (shouldRequestMore)
             {
                 REQUIRE(conn.getInitiator()->checkCapacity(conn.getAcceptor()));
@@ -249,7 +249,8 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
                             ->getFlowControl()
                             ->getCapacityBytes()
                             .getOutboundCapacity() ==
-                        (cfg2.PEER_FLOOD_READING_CAPACITY_BYTES - txSize));
+                        (app2->getOverlayManager().getFlowControlBytesTotal() -
+                         txSize));
             }
             REQUIRE(conn.getAcceptor()->checkCapacity(conn.getInitiator()));
         }
@@ -278,6 +279,12 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
         cfg2.PEER_FLOOD_READING_CAPACITY = 1;
         cfg2.FLOW_CONTROL_SEND_MORE_BATCH_SIZE = 1;
         test(true);
+    }
+    SECTION("automatic calculation of byte configs")
+    {
+        cfg2.PEER_FLOOD_READING_CAPACITY_BYTES = 0;
+        cfg2.FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES = 0;
+        test(false);
     }
     SECTION("mixed versions")
     {
@@ -364,8 +371,8 @@ TEST_CASE("flow control byte capacity", "[overlay][flowcontrol]")
             txtest::executeUpgrade(*app, txtest::makeConfigUpgrade(*res));
         };
 
-        auto& txsRecv =
-            app2->getMetrics().NewTimer({"overlay", "recv", "transaction"});
+        auto& txsRecv = app2->getMetrics().NewCounter(
+            {"overlay", "recv-transaction", "count"});
         auto start = txsRecv.count();
         conn.getInitiator()->sendMessage(std::make_shared<StellarMessage>(tx1));
 
@@ -763,6 +770,49 @@ TEST_CASE("failed auth", "[overlay][connections]")
     testutil::shutdownWorkScheduler(*app1);
 }
 
+TEST_CASE("peers during auth", "[overlay][connections]")
+{
+    VirtualClock clock;
+    Config const& cfg1 = getTestConfig(0);
+    Config const& cfg2 = getTestConfig(1);
+    auto app1 = createTestApplication(clock, cfg1);
+    auto app2 = createTestApplication(clock, cfg2);
+    // Put a peer into Acceptor's DB to trigger sending of peers during auth
+    app2->getOverlayManager().getPeerManager().ensureExists(
+        PeerBareAddress{"1.1.1.1", 11625});
+
+    LoopbackPeerConnection conn(*app1, *app2);
+    testutil::crankSome(clock);
+
+    REQUIRE(conn.getInitiator()->isAuthenticatedForTesting());
+    REQUIRE(conn.getAcceptor()->isAuthenticatedForTesting());
+
+    StellarMessage newMsg;
+    newMsg.type(PEERS);
+    std::string dropReason;
+    SECTION("inbound")
+    {
+        dropReason = "received PEERS";
+        conn.getInitiator()->sendMessage(
+            std::make_shared<StellarMessage>(newMsg));
+    }
+    SECTION("outbound")
+    {
+        dropReason = "too many msgs PEERS";
+        conn.getAcceptor()->sendMessage(
+            std::make_shared<StellarMessage>(newMsg));
+    }
+
+    testutil::crankFor(clock, std::chrono::seconds(1));
+
+    REQUIRE(!conn.getInitiator()->isConnectedForTesting());
+    REQUIRE(!conn.getAcceptor()->isConnectedForTesting());
+    REQUIRE(conn.getAcceptor()->getDropReason() == dropReason);
+
+    testutil::shutdownWorkScheduler(*app2);
+    testutil::shutdownWorkScheduler(*app1);
+}
+
 TEST_CASE("outbound queue filtering", "[overlay][connections]")
 {
     auto networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
@@ -857,7 +907,8 @@ TEST_CASE("outbound queue filtering", "[overlay][connections]")
     {
         // Advance to next checkpoint
         auto nextCheckpoint =
-            node->getHistoryManager().firstLedgerAfterCheckpointContaining(lcl);
+            HistoryManager::firstLedgerAfterCheckpointContaining(
+                lcl, node->getConfig());
         simulation->crankUntil(
             [&]() {
                 return simulation->haveAllExternalized(nextCheckpoint, 1);
@@ -867,7 +918,7 @@ TEST_CASE("outbound queue filtering", "[overlay][connections]")
 
         envs = herder.getSCP().getLatestMessagesSend(nextCheckpoint);
         auto checkpointFreq =
-            node->getHistoryManager().getCheckpointFrequency();
+            HistoryManager::getCheckpointFrequency(node->getConfig());
         for (auto& env : envs)
         {
             env.statement.slotIndex -= checkpointFreq;
@@ -1766,7 +1817,7 @@ TEST_CASE("drop peers who straggle", "[overlay][connections][straggler]")
             sendTimer.async_wait([straggler](asio::error_code const& error) {
                 if (!error)
                 {
-                    straggler->sendGetPeers();
+                    straggler->sendGetTxSet(Hash());
                 }
             });
             testutil::crankFor(clock, dur);
@@ -2553,7 +2604,7 @@ TEST_CASE("overlay pull mode", "[overlay][pullmode]")
                         .count() == 2);
             REQUIRE(apps[2]
                         ->getMetrics()
-                        .NewTimer({"overlay", "recv", "transaction"})
+                        .NewCounter({"overlay", "recv-transaction", "count"})
                         .count() == 1);
             REQUIRE(getAdvertisedHashCount(apps[2]) == 0);
         }

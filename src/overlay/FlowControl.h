@@ -13,11 +13,15 @@
 namespace stellar
 {
 
-class OverlayAppConnector;
+class AppConnector;
 struct OverlayMetrics;
 
-// num messages, bytes
-using SendMoreCapacity = std::pair<uint64_t, uint64_t>;
+struct SendMoreCapacity
+{
+    uint64_t numFloodMessages{0};
+    uint64_t numFloodBytes{0};
+    uint32_t numTotalMessages{0};
+};
 
 // The FlowControl class allows core to throttle flood traffic among its
 // connections. If a connections wants to use flow control, it should maintain
@@ -66,7 +70,7 @@ class FlowControl
     FlowControlByteCapacity mFlowControlBytesCapacity;
 
     OverlayMetrics& mOverlayMetrics;
-    OverlayAppConnector& mAppConnector;
+    AppConnector& mAppConnector;
     bool const mUseBackgroundThread;
 
     // Outbound queues indexes by priority
@@ -82,6 +86,9 @@ class FlowControl
     // How many bytes we received and processed since sending
     // SEND_MORE to this peer
     uint64_t mFloodDataProcessedBytes{0};
+    // How many total messages we received and processed so far (used to track
+    // throttling)
+    uint64_t mTotalMsgsProcessed{0};
     std::optional<VirtualClock::time_point> mNoOutboundCapacity;
     FlowControlMetrics mMetrics;
 
@@ -92,7 +99,7 @@ class FlowControl
     bool canRead(std::lock_guard<std::mutex> const& lockGuard) const;
 
   public:
-    FlowControl(OverlayAppConnector& connector, bool useBackgoundThread);
+    FlowControl(AppConnector& connector, bool useBackgoundThread);
     virtual ~FlowControl() = default;
 
     void maybeReleaseCapacity(StellarMessage const& msg);
@@ -178,7 +185,7 @@ class FlowControl
     bool maybeThrottleRead();
     // After releasing capacity, check if throttling was applied, and if so,
     // reset it. Returns true if peer was throttled, and false otherwise
-    bool stopThrottling();
+    void stopThrottling();
     bool isThrottled() const;
 };
 
